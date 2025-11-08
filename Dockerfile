@@ -10,4 +10,4 @@ RUN nohup ollama serve > /dev/null 2>&1 & \
 EXPOSE 11434
 
 # Run Ollama server
-CMD ["serve"]
+CMD ["/bin/ollama", "serve"]
