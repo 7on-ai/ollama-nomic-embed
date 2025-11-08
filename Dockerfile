@@ -11,12 +11,3 @@ EXPOSE 11434
 
 # Run Ollama server
 CMD ["ollama", "serve"]
-```
-
-### **Step 3: สร้าง .dockerignore**
-
-สร้างไฟล์ `.dockerignore`:
-```
-.git
-.gitignore
-README.md
