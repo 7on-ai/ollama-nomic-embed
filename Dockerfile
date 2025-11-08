@@ -9,5 +9,5 @@ RUN nohup ollama serve > /dev/null 2>&1 & \
 # Expose port
 EXPOSE 11434
 
-# Run Ollama server
-CMD ["/bin/ollama", "serve"]
+# Default command (will be overridden by Northflank)
+CMD ["serve"]
