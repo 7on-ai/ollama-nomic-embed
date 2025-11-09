@@ -15,20 +15,20 @@ ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Install Python packages in venv
+# Install Python packages with compatible versions
 RUN pip install --no-cache-dir \
-    torch==2.1.0 \
-    transformers==4.36.0
+    torch \
+    transformers
 
 RUN pip install --no-cache-dir \
-    peft==0.7.0 \
-    bitsandbytes==0.41.3 \
-    accelerate==0.25.0
+    peft \
+    bitsandbytes \
+    accelerate
 
 RUN pip install --no-cache-dir \
-    datasets==2.15.0 \
-    psycopg2-binary==2.9.9 \
-    scikit-learn==1.3.2
+    datasets \
+    psycopg2-binary \
+    scikit-learn
 
 # Create directories
 RUN mkdir -p /models/adapters /scripts
