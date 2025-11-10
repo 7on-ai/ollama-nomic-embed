@@ -1,6 +1,6 @@
 """
 Flask API for Ollama Training Service
-✅ FIXED: Added CORS support for cross-origin requests
+✅ FIXED: Added CORS support + Debug route
 """
 
 from flask import Flask, request, jsonify
@@ -26,6 +26,9 @@ CORS(app, resources={
 # In-memory training status store
 training_jobs = {}
 training_lock = threading.Lock()
+
+# ✅ DEBUG: Version check
+APP_VERSION = "2.0-CORS"
 
 def run_training_script(training_id, params):
     """
@@ -98,12 +101,23 @@ def run_training_script(training_id, params):
         training_jobs[training_id]['completed_at'] = datetime.utcnow().isoformat()
         print(f"❌ Training {training_id} exception: {e}")
 
+@app.route('/', methods=['GET'])
+def index():
+    """Root endpoint"""
+    return jsonify({
+        'service': 'ollama-training',
+        'version': APP_VERSION,
+        'status': 'running',
+        'endpoints': ['/health', '/api/train', '/api/train/status/<id>', '/api/train/list']
+    })
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
         'service': 'ollama-training',
+        'version': APP_VERSION,
         'timestamp': datetime.utcnow().isoformat(),
         'active_trainings': len([j for j in training_jobs.values() if j['status'] == 'running'])
     })
@@ -123,12 +137,15 @@ def start_training():
         "output_dir": "/models/adapters/user-xxx/v1731234567890"
     }
     """
+    print(f"📥 Received {request.method} request to /api/train")
+    
     # ✅ Handle OPTIONS request (CORS preflight)
     if request.method == 'OPTIONS':
         return '', 204
     
     try:
         data = request.json
+        print(f"📦 Request data: {list(data.keys()) if data else 'None'}")
         
         # Validate required fields
         required = ['user_id', 'adapter_version', 'training_id', 'postgres_uri', 'base_model']
@@ -291,5 +308,6 @@ def list_trainings():
 
 if __name__ == '__main__':
     print("🚀 Starting Ollama Training API Server")
+    print(f"📡 Version: {APP_VERSION}")
     print("📡 Listening on 0.0.0.0:5000")
     app.run(host='0.0.0.0', port=5000, debug=False)
