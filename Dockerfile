@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y \
     python3-dev \
     python3-venv \
     git \
+    curl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -40,19 +41,46 @@ RUN chmod +x /scripts/train_lora.py
 # Expose port
 EXPOSE 11434
 
-# Entrypoint with venv activated
+# ✅ FIXED: Better entrypoint with model pulling
 RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+# Activate virtualenv\n\
 source /opt/venv/bin/activate\n\
-if [ ! -f /root/.ollama/models/manifests/registry.ollama.ai/library/nomic-embed-text/latest ]; then\n\
-  echo "Pulling models..."\n\
-  nohup ollama serve > /dev/null 2>&1 &\n\
-  sleep 15\n\
-  ollama pull nomic-embed-text\n\
-  ollama pull mistral\n\
-  pkill ollama\n\
-  sleep 5\n\
+\n\
+echo "🚀 Starting Ollama service..."\n\
+\n\
+# Start Ollama in background\n\
+ollama serve > /var/log/ollama.log 2>&1 &\n\
+OLLAMA_PID=$!\n\
+\n\
+echo "⏳ Waiting for Ollama to be ready..."\n\
+sleep 10\n\
+\n\
+# Wait for Ollama to be fully ready\n\
+for i in {1..30}; do\n\
+  if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then\n\
+    echo "✅ Ollama is ready!"\n\
+    break\n\
+  fi\n\
+  echo "   Still waiting... ($i/30)"\n\
+  sleep 2\n\
+done\n\
+\n\
+# Check if models exist\n\
+MODELS=$(curl -s http://localhost:11434/api/tags | grep -o "nomic-embed-text" || echo "")\n\
+\n\
+if [ -z "$MODELS" ]; then\n\
+  echo "📥 Pulling required models..."\n\
+  ollama pull nomic-embed-text || echo "⚠️  Failed to pull nomic-embed-text"\n\
+  ollama pull mistral || echo "⚠️  Failed to pull mistral"\n\
+  echo "✅ Models pulled successfully"\n\
+else\n\
+  echo "✅ Models already exist"\n\
 fi\n\
-exec ollama serve\n\
+\n\
+# Keep Ollama running in foreground\n\
+wait $OLLAMA_PID\n\
 ' > /entrypoint.sh && chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
