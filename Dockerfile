@@ -33,6 +33,7 @@ RUN pip install --no-cache-dir \
     psycopg2-binary \
     scikit-learn \
     flask \
+    flask-cors \
     gunicorn
 
 # -----------------------------
