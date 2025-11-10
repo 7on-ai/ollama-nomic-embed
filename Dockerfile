@@ -60,8 +60,8 @@ RUN chmod +x /entrypoint.sh
 # -----------------------------
 # Expose ports
 # -----------------------------
-EXPOSE 11434  # Ollama
-EXPOSE 5000   # Training API (Flask)
+EXPOSE 11434
+EXPOSE 5000
 
 # -----------------------------
 # Entrypoint
