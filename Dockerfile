@@ -1,4 +1,3 @@
-"""
 FROM ollama/ollama:latest
 
 # Install dependencies
@@ -102,4 +101,3 @@ wait -n $OLLAMA_PID $API_PID\n\
 ' > /entrypoint.sh && chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
-"""
