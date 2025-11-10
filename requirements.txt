@@ -1,0 +1,12 @@
+"""
+flask==3.0.0
+gunicorn==21.2.0
+torch
+transformers
+peft
+bitsandbytes
+accelerate
+datasets
+psycopg2-binary
+scikit-learn
+"""
