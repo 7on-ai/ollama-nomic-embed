@@ -1,13 +1,10 @@
 """
 Flask API for Ollama Training Service
-Endpoints:
-  - POST /api/train - Start training
-  - GET /api/train/status/<training_id> - Check status
-  - GET /health - Health check
+✅ FIXED: Added CORS support for cross-origin requests
 """
 
-
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import threading
 import subprocess
 import json
@@ -16,6 +13,15 @@ from datetime import datetime
 import time
 
 app = Flask(__name__)
+
+# ✅ CRITICAL: Enable CORS for all routes
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
 # In-memory training status store
 training_jobs = {}
@@ -102,7 +108,7 @@ def health_check():
         'active_trainings': len([j for j in training_jobs.values() if j['status'] == 'running'])
     })
 
-@app.route('/api/train', methods=['POST'])
+@app.route('/api/train', methods=['POST', 'OPTIONS'])
 def start_training():
     """
     Start LoRA training job
@@ -117,6 +123,10 @@ def start_training():
         "output_dir": "/models/adapters/user-xxx/v1731234567890"
     }
     """
+    # ✅ Handle OPTIONS request (CORS preflight)
+    if request.method == 'OPTIONS':
+        return '', 204
+    
     try:
         data = request.json
         
