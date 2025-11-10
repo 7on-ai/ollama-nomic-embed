@@ -1,3 +1,4 @@
+"""
 FROM ollama/ollama:latest
 
 # Install dependencies
@@ -31,6 +32,11 @@ RUN pip install --no-cache-dir \
     psycopg2-binary \
     scikit-learn
 
+# ✅ NEW: Install Flask for API
+RUN pip install --no-cache-dir \
+    flask \
+    gunicorn
+
 # Create directories
 RUN mkdir -p /models/adapters /scripts
 
@@ -38,10 +44,14 @@ RUN mkdir -p /models/adapters /scripts
 COPY scripts/train_complete.py /scripts/train_lora.py
 RUN chmod +x /scripts/train_lora.py
 
-# Expose port
-EXPOSE 11434
+# ✅ NEW: Copy Flask API
+COPY app.py /app.py
 
-# ✅ FIXED: Better entrypoint with model pulling
+# Expose ports
+EXPOSE 11434
+EXPOSE 5000
+
+# ✅ FIXED: Updated entrypoint with Flask API
 RUN echo '#!/bin/bash\n\
 set -e\n\
 \n\
@@ -79,8 +89,17 @@ else\n\
   echo "✅ Models already exist"\n\
 fi\n\
 \n\
-# Keep Ollama running in foreground\n\
-wait $OLLAMA_PID\n\
+echo "🌐 Starting Flask API on port 5000..."\n\
+gunicorn --bind 0.0.0.0:5000 --workers 2 --timeout 7200 app:app &\n\
+API_PID=$!\n\
+\n\
+echo "✅ All services started"\n\
+echo "   - Ollama: http://localhost:11434"\n\
+echo "   - Training API: http://localhost:5000"\n\
+\n\
+# Keep services running\n\
+wait -n $OLLAMA_PID $API_PID\n\
 ' > /entrypoint.sh && chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
+"""
