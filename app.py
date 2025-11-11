@@ -1,6 +1,6 @@
 """
 Flask API for Ollama Training Service
-✅ FIXED: Added CORS support + Debug route + Request logging
+✅ FIXED: Support GET on /api/train for debugging + Better error handling
 """
 
 from flask import Flask, request, jsonify, make_response
@@ -27,7 +27,7 @@ CORS(app,
 training_jobs = {}
 training_lock = threading.Lock()
 
-APP_VERSION = "2.1-FIXED"
+APP_VERSION = "2.2-FIXED"
 
 # ✅ Add OPTIONS handler for all routes
 @app.after_request
@@ -41,7 +41,7 @@ def after_request(response):
 @app.before_request
 def log_request():
     print(f"📥 {request.method} {request.path} from {request.remote_addr}")
-    if request.method == 'POST':
+    if request.method in ['POST', 'PUT']:
         print(f"   Content-Type: {request.content_type}")
         print(f"   Content-Length: {request.content_length}")
     return None
@@ -53,7 +53,7 @@ def run_training_script(training_id, params):
     """
     try:
         training_jobs[training_id]['status'] = 'running'
-        training_jobs[training_id]['started_at'] = datetime.utcnow().isoformat()
+        training_jobs[training_id]['started_at'] = datetime.now(datetime.UTC).isoformat()
         
         # Prepare command
         cmd = [
@@ -97,13 +97,13 @@ def run_training_script(training_id, params):
         
         if process.returncode == 0:
             training_jobs[training_id]['status'] = 'completed'
-            training_jobs[training_id]['completed_at'] = datetime.utcnow().isoformat()
+            training_jobs[training_id]['completed_at'] = datetime.now(datetime.UTC).isoformat()
             training_jobs[training_id]['metadata'] = metadata
             training_jobs[training_id]['final_loss'] = metadata.get('metrics', {}).get('loss') if metadata else None
             print(f"✅ Training {training_id} completed successfully")
         else:
             training_jobs[training_id]['status'] = 'failed'
-            training_jobs[training_id]['completed_at'] = datetime.utcnow().isoformat()
+            training_jobs[training_id]['completed_at'] = datetime.now(datetime.UTC).isoformat()
             training_jobs[training_id]['error'] = stderr or 'Training script failed'
             print(f"❌ Training {training_id} failed: {stderr}")
         
@@ -114,7 +114,7 @@ def run_training_script(training_id, params):
     except Exception as e:
         training_jobs[training_id]['status'] = 'failed'
         training_jobs[training_id]['error'] = str(e)
-        training_jobs[training_id]['completed_at'] = datetime.utcnow().isoformat()
+        training_jobs[training_id]['completed_at'] = datetime.now(datetime.UTC).isoformat()
         print(f"❌ Training {training_id} exception: {e}")
 
 @app.route('/', methods=['GET'])
@@ -134,16 +134,16 @@ def health_check():
         'status': 'healthy',
         'service': 'ollama-training',
         'version': APP_VERSION,
-        'timestamp': datetime.utcnow().isoformat(),
+        'timestamp': datetime.now(datetime.UTC).isoformat(),
         'active_trainings': len([j for j in training_jobs.values() if j['status'] == 'running'])
     })
 
-@app.route('/api/train', methods=['POST', 'OPTIONS'])
-def start_training():
+@app.route('/api/train', methods=['GET', 'POST', 'OPTIONS'])
+def train_endpoint():
     """
-    Start LoRA training job
+    Training endpoint - supports both GET (for debug) and POST
     
-    Request body:
+    POST Request body:
     {
         "user_id": "user-xxx",
         "adapter_version": "v1731234567890",
@@ -159,14 +159,34 @@ def start_training():
         response = make_response('', 204)
         response.headers.add('Access-Control-Allow-Origin', '*')
         response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'POST,OPTIONS')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
         return response
     
-    print(f"📥 Received {request.method} request to /api/train")
+    # ✅ Handle GET request (for debugging - return endpoint info)
+    if request.method == 'GET':
+        return jsonify({
+            'endpoint': '/api/train',
+            'method': 'POST',
+            'description': 'Start LoRA training job',
+            'required_fields': ['user_id', 'adapter_version', 'training_id', 'postgres_uri', 'base_model'],
+            'optional_fields': ['output_dir'],
+            'current_active_jobs': len([j for j in training_jobs.values() if j['status'] == 'running']),
+            'total_jobs': len(training_jobs),
+            'note': 'This is GET response - use POST to start training'
+        }), 200
+    
+    # ✅ Handle POST request (actual training)
+    print(f"📥 Received POST request to /api/train")
     
     try:
         data = request.json
-        print(f"📦 Request data: {list(data.keys()) if data else 'None'}")
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'No JSON data provided'
+            }), 400
+            
+        print(f"📦 Request data: {list(data.keys())}")
         
         # Validate required fields
         required = ['user_id', 'adapter_version', 'training_id', 'postgres_uri', 'base_model']
@@ -207,7 +227,7 @@ def start_training():
                 'adapter_version': data['adapter_version'],
                 'base_model': data['base_model'],
                 'status': 'initializing',
-                'created_at': datetime.utcnow().isoformat(),
+                'created_at': datetime.now(datetime.UTC).isoformat(),
                 'progress': 0
             }
         
@@ -243,9 +263,12 @@ def start_training():
         
     except Exception as e:
         print(f"❌ Start training error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': str(e),
+            'traceback': traceback.format_exc()
         }), 500
 
 @app.route('/api/train/status/<training_id>', methods=['GET'])
@@ -265,7 +288,7 @@ def get_training_status(training_id):
         if job['status'] == 'running':
             # Estimate based on time elapsed (assume 20 min average)
             if 'started_at' in job:
-                elapsed = (datetime.utcnow() - datetime.fromisoformat(job['started_at'])).total_seconds()
+                elapsed = (datetime.now(datetime.UTC) - datetime.fromisoformat(job['started_at'].replace('Z', '+00:00'))).total_seconds()
                 progress = min(int((elapsed / (20 * 60)) * 100), 95)
         elif job['status'] == 'completed':
             progress = 100
