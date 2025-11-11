@@ -1,9 +1,9 @@
 """
 Flask API for Ollama Training Service
-✅ FIXED: Added CORS support + Debug route
+✅ FIXED: Added CORS support + Debug route + Request logging
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 import threading
 import subprocess
@@ -14,21 +14,37 @@ import time
 
 app = Flask(__name__)
 
-# ✅ CRITICAL: Enable CORS for all routes
-CORS(app, resources={
-    r"/*": {
-        "origins": "*",
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
+# ✅ CRITICAL: Enable CORS with explicit configuration
+CORS(app, 
+     origins="*",
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+     allow_headers=["Content-Type", "Authorization", "Accept"],
+     expose_headers=["Content-Type"],
+     supports_credentials=False,
+     max_age=3600)
 
 # In-memory training status store
 training_jobs = {}
 training_lock = threading.Lock()
 
-# ✅ DEBUG: Version check
-APP_VERSION = "2.0-CORS"
+APP_VERSION = "2.1-FIXED"
+
+# ✅ Add OPTIONS handler for all routes
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
+# ✅ Add request logging
+@app.before_request
+def log_request():
+    print(f"📥 {request.method} {request.path} from {request.remote_addr}")
+    if request.method == 'POST':
+        print(f"   Content-Type: {request.content_type}")
+        print(f"   Content-Length: {request.content_length}")
+    return None
 
 def run_training_script(training_id, params):
     """
@@ -137,11 +153,16 @@ def start_training():
         "output_dir": "/models/adapters/user-xxx/v1731234567890"
     }
     """
-    print(f"📥 Received {request.method} request to /api/train")
     
     # ✅ Handle OPTIONS request (CORS preflight)
     if request.method == 'OPTIONS':
-        return '', 204
+        response = make_response('', 204)
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'POST,OPTIONS')
+        return response
+    
+    print(f"📥 Received {request.method} request to /api/train")
     
     try:
         data = request.json
@@ -307,7 +328,31 @@ def list_trainings():
         }), 500
 
 if __name__ == '__main__':
+    import socket
+    
+    print("========================================")
     print("🚀 Starting Ollama Training API Server")
+    print("========================================")
     print(f"📡 Version: {APP_VERSION}")
-    print("📡 Listening on 0.0.0.0:5000")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    print(f"📡 Host: 0.0.0.0")
+    print(f"📡 Port: 5000")
+    print(f"💻 Hostname: {socket.gethostname()}")
+    print(f"📂 Working dir: {os.getcwd()}")
+    print("========================================")
+    print("")
+    print("Available routes:")
+    for rule in app.url_map.iter_rules():
+        methods = ','.join(sorted(rule.methods))
+        print(f"  {methods:20s} {rule}")
+    print("")
+    print("========================================")
+    print("🎯 Starting server...")
+    print("========================================")
+    
+    try:
+        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    except Exception as e:
+        print(f"❌ Failed to start: {e}")
+        import traceback
+        traceback.print_exc()
+        exit(1)
