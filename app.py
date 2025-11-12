@@ -1,6 +1,6 @@
 """
 Flask API for Ollama Training Service
-✅ FIXED: Support GET on /api/train for debugging + Better error handling
+✅ FIXED: datetime.UTC → datetime.utcnow() for Python 3.10 compatibility
 """
 
 from flask import Flask, request, jsonify, make_response
@@ -27,7 +27,7 @@ CORS(app,
 training_jobs = {}
 training_lock = threading.Lock()
 
-APP_VERSION = "2.2-FIXED"
+APP_VERSION = "2.3-DATETIME-FIX"
 
 # ✅ Add OPTIONS handler for all routes
 @app.after_request
@@ -53,7 +53,7 @@ def run_training_script(training_id, params):
     """
     try:
         training_jobs[training_id]['status'] = 'running'
-        training_jobs[training_id]['started_at'] = datetime.now(datetime.UTC).isoformat()
+        training_jobs[training_id]['started_at'] = datetime.utcnow().isoformat()
         
         # Prepare command
         cmd = [
@@ -97,13 +97,13 @@ def run_training_script(training_id, params):
         
         if process.returncode == 0:
             training_jobs[training_id]['status'] = 'completed'
-            training_jobs[training_id]['completed_at'] = datetime.now(datetime.UTC).isoformat()
+            training_jobs[training_id]['completed_at'] = datetime.utcnow().isoformat()
             training_jobs[training_id]['metadata'] = metadata
             training_jobs[training_id]['final_loss'] = metadata.get('metrics', {}).get('loss') if metadata else None
             print(f"✅ Training {training_id} completed successfully")
         else:
             training_jobs[training_id]['status'] = 'failed'
-            training_jobs[training_id]['completed_at'] = datetime.now(datetime.UTC).isoformat()
+            training_jobs[training_id]['completed_at'] = datetime.utcnow().isoformat()
             training_jobs[training_id]['error'] = stderr or 'Training script failed'
             print(f"❌ Training {training_id} failed: {stderr}")
         
@@ -114,7 +114,7 @@ def run_training_script(training_id, params):
     except Exception as e:
         training_jobs[training_id]['status'] = 'failed'
         training_jobs[training_id]['error'] = str(e)
-        training_jobs[training_id]['completed_at'] = datetime.now(datetime.UTC).isoformat()
+        training_jobs[training_id]['completed_at'] = datetime.utcnow().isoformat()
         print(f"❌ Training {training_id} exception: {e}")
 
 @app.route('/', methods=['GET'])
@@ -134,7 +134,7 @@ def health_check():
         'status': 'healthy',
         'service': 'ollama-training',
         'version': APP_VERSION,
-        'timestamp': datetime.now(datetime.UTC).isoformat(),
+        'timestamp': datetime.utcnow().isoformat(),
         'active_trainings': len([j for j in training_jobs.values() if j['status'] == 'running'])
     })
 
@@ -227,7 +227,7 @@ def train_endpoint():
                 'adapter_version': data['adapter_version'],
                 'base_model': data['base_model'],
                 'status': 'initializing',
-                'created_at': datetime.now(datetime.UTC).isoformat(),
+                'created_at': datetime.utcnow().isoformat(),
                 'progress': 0
             }
         
@@ -288,7 +288,7 @@ def get_training_status(training_id):
         if job['status'] == 'running':
             # Estimate based on time elapsed (assume 20 min average)
             if 'started_at' in job:
-                elapsed = (datetime.now(datetime.UTC) - datetime.fromisoformat(job['started_at'].replace('Z', '+00:00'))).total_seconds()
+                elapsed = (datetime.utcnow() - datetime.fromisoformat(job['started_at'])).total_seconds()
                 progress = min(int((elapsed / (20 * 60)) * 100), 95)
         elif job['status'] == 'completed':
             progress = 100
@@ -344,7 +344,7 @@ def list_trainings():
             'jobs': jobs_list
         })
         
-    except Exception as e:
+    } except Exception as e:
         return jsonify({
             'success': False,
             'error': str(e)
