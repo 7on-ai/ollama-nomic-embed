@@ -149,7 +149,7 @@ def train_endpoint():
         "adapter_version": "v1731234567890",
         "training_id": "train-xxx-v1731234567890",
         "postgres_uri": "postgresql://...",
-        "base_model": "mistral",
+        "base_model": "mistralai/Mistral-7B-Instruct-v0.2",
         "output_dir": "/models/adapters/user-xxx/v1731234567890"
     }
     """
