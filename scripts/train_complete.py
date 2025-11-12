@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Complete LoRA Training Pipeline
-✅ FIXED: Use BitsAndBytesConfig instead of deprecated load_in_8bit
-✅ FIXED: Better error handling and validation
-✅ FIXED: Use TinyLlama by default (smaller, faster)
+- Good channel → imitation learning
+- Bad channel → detector training + safe counterfactuals
+- MCL → moral reasoning tasks
 """
 
 import json
@@ -16,7 +16,6 @@ from transformers import (
     AutoTokenizer,
     TrainingArguments,
     Trainer,
-    BitsAndBytesConfig,  # ✅ NEW
 )
 from peft import (
     LoraConfig,
@@ -211,7 +210,7 @@ def train_detectors(bad_data, output_dir):
             print(f"  ⚠️  Skipping {tag} (only {len(texts)} samples)")
             continue
         
-        # Create negative samples
+        # Create negative samples (from good channel - simplified)
         negative_samples = ["This is a normal conversation"] * len(texts)
         
         # Prepare data
@@ -274,27 +273,36 @@ def train_complete_lora(
     print(f"  Bad channel: {len(bad_data)} samples")
     print(f"  MCL chains: {len(mcl_data)} samples")
     
-    # ✅ Validate data
+    # ✅ FIXED: Validate total data AND minimum good data
     total_samples = len(good_data) + len(bad_data) + len(mcl_data)
     
     print(f"\n📊 Validation:")
     print(f"  Total samples: {total_samples}")
     print(f"  Good samples: {len(good_data)}")
     
+    # Check total samples
     if total_samples < 10:
         raise ValueError(
             f"❌ Not enough training data!\n"
             f"   Total: {total_samples} (need at least 10)\n"
-            f"   Breakdown: Good={len(good_data)}, Bad={len(bad_data)}, MCL={len(mcl_data)}"
+            f"   Breakdown:\n"
+            f"   - Good: {len(good_data)}\n"
+            f"   - Bad: {len(bad_data)}\n"
+            f"   - MCL: {len(mcl_data)}\n"
+            f"\n💡 Add more conversations to reach minimum requirement."
         )
     
+    # Check minimum good samples for imitation learning
     if len(good_data) < 5:
         raise ValueError(
-            f"❌ Not enough good channel data!\n"
-            f"   Good: {len(good_data)} (need at least 5)"
+            f"❌ Not enough good channel data for imitation learning!\n"
+            f"   Good: {len(good_data)} (need at least 5)\n"
+            f"   Total: {total_samples}\n"
+            f"\n💡 Good channel data is essential for quality training.\n"
+            f"   Chat naturally with the AI to generate more positive examples."
         )
     
-    print(f"✅ Validation passed")
+    print(f"✅ Validation passed: {total_samples} total, {len(good_data)} good")
     
     # 2. Create training pairs
     print("\n📝 Creating training pairs...")
@@ -302,43 +310,18 @@ def train_complete_lora(
     counterfactual_pairs = create_counterfactual_pairs(bad_data) if bad_data else []
     mcl_pairs = create_mcl_pairs(mcl_data) if mcl_data else []
     
-    # 3. Train detectors
+    # 3. Train detectors (from bad channel)
     print("\n🔍 Training detectors...")
     detectors = train_detectors(bad_data, output_dir) if bad_data else {}
     
-    # 4. ✅ FIXED: Use BitsAndBytesConfig instead of load_in_8bit
+    # 4. Load model
     print("\n🧠 Loading base model...")
-    print(f"   Model: {base_model}")
-    
-    # ✅ NEW: Configure quantization properly
-    bnb_config = BitsAndBytesConfig(
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
         load_in_8bit=True,
-        bnb_8bit_compute_dtype=torch.float16,
-        bnb_8bit_use_double_quant=True,
+        device_map="auto",
+        trust_remote_code=True,
     )
-    
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            quantization_config=bnb_config,  # ✅ Use new parameter
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        print("✅ Model loaded successfully")
-    except Exception as e:
-        print(f"❌ Model loading failed: {e}")
-        # Fallback to TinyLlama if base_model fails
-        if "mistral" in base_model.lower():
-            print("⚠️  Mistral too large, falling back to TinyLlama...")
-            base_model = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-            model = AutoModelForCausalLM.from_pretrained(
-                base_model,
-                quantization_config=bnb_config,
-                device_map="auto",
-                trust_remote_code=True,
-            )
-        else:
-            raise
     
     model = prepare_model_for_kbit_training(model)
     
@@ -388,9 +371,8 @@ def train_complete_lora(
     # 8. Save
     print("\n💾 Saving artifacts...")
     model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)  # ✅ Save tokenizer too
     
-    # 9. Clean up
+    # 9. Clean up memory
     cleanup_memory()
     
     # 10. Metadata
@@ -424,7 +406,7 @@ def train_complete_lora(
     print("\n✅ Training completed!")
     print(f"📊 Final loss: {result.training_loss:.4f}")
     print(f"🔍 Detectors: {len(detectors)} categories")
-    print(f"📈 Total samples: {total_samples}")
+    print(f"📈 Total samples used: {total_samples}")
     
     return metadata
 
@@ -437,12 +419,6 @@ if __name__ == "__main__":
     user_id = sys.argv[2]
     base_model = sys.argv[3]
     adapter_name = sys.argv[4]
-    
-    # ✅ Use TinyLlama by default if mistral specified
-    if "mistral" in base_model.lower():
-        print("⚠️  WARNING: Mistral 7B requires 28GB+ memory")
-        print("   Using TinyLlama 1.1B instead (much faster, less memory)")
-        base_model = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     
     output_dir = f"/models/adapters/{user_id}/{adapter_name}"
     os.makedirs(output_dir, exist_ok=True)
