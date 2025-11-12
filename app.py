@@ -344,7 +344,7 @@ def list_trainings():
             'jobs': jobs_list
         })
         
-    } except Exception as e:
+    except Exception as e:
         return jsonify({
             'success': False,
             'error': str(e)
