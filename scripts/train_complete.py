@@ -29,6 +29,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import pickle
+import gc
 
 # ===== Configuration =====
 CONFIG = {
@@ -241,6 +242,13 @@ def train_detectors(bad_data, output_dir):
     
     return detectors
 
+def cleanup_memory():
+    """Clean up memory after training"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("🧹 Memory cleaned up")
+
 def train_complete_lora(
     postgres_uri: str,
     user_id: str,
@@ -265,8 +273,36 @@ def train_complete_lora(
     print(f"  Bad channel: {len(bad_data)} samples")
     print(f"  MCL chains: {len(mcl_data)} samples")
     
-    if len(good_data) < 10:
-        raise ValueError(f"Not enough good data (got {len(good_data)}, need at least 10)")
+    # ✅ FIXED: Validate total data AND minimum good data
+    total_samples = len(good_data) + len(bad_data) + len(mcl_data)
+    
+    print(f"\n📊 Validation:")
+    print(f"  Total samples: {total_samples}")
+    print(f"  Good samples: {len(good_data)}")
+    
+    # Check total samples
+    if total_samples < 10:
+        raise ValueError(
+            f"❌ Not enough training data!\n"
+            f"   Total: {total_samples} (need at least 10)\n"
+            f"   Breakdown:\n"
+            f"   - Good: {len(good_data)}\n"
+            f"   - Bad: {len(bad_data)}\n"
+            f"   - MCL: {len(mcl_data)}\n"
+            f"\n💡 Add more conversations to reach minimum requirement."
+        )
+    
+    # Check minimum good samples for imitation learning
+    if len(good_data) < 5:
+        raise ValueError(
+            f"❌ Not enough good channel data for imitation learning!\n"
+            f"   Good: {len(good_data)} (need at least 5)\n"
+            f"   Total: {total_samples}\n"
+            f"\n💡 Good channel data is essential for quality training.\n"
+            f"   Chat naturally with the AI to generate more positive examples."
+        )
+    
+    print(f"✅ Validation passed: {total_samples} total, {len(good_data)} good")
     
     # 2. Create training pairs
     print("\n📝 Creating training pairs...")
@@ -336,7 +372,10 @@ def train_complete_lora(
     print("\n💾 Saving artifacts...")
     model.save_pretrained(output_dir)
     
-    # 9. Metadata
+    # 9. Clean up memory
+    cleanup_memory()
+    
+    # 10. Metadata
     metadata = {
         "user_id": user_id,
         "adapter_name": adapter_name,
@@ -346,6 +385,12 @@ def train_complete_lora(
             "counterfactuals": len(counterfactual_pairs),
             "mcl_chains": len(mcl_pairs),
             "total": len(good_pairs) + len(counterfactual_pairs) + len(mcl_pairs),
+        },
+        "data_stats": {
+            "good_samples": len(good_data),
+            "bad_samples": len(bad_data),
+            "mcl_samples": len(mcl_data),
+            "total_samples": total_samples,
         },
         "detectors_trained": list(detectors.keys()),
         "config": CONFIG,
@@ -361,6 +406,7 @@ def train_complete_lora(
     print("\n✅ Training completed!")
     print(f"📊 Final loss: {result.training_loss:.4f}")
     print(f"🔍 Detectors: {len(detectors)} categories")
+    print(f"📈 Total samples used: {total_samples}")
     
     return metadata
 
@@ -395,3 +441,4 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
+        
