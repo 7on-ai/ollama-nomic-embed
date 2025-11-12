@@ -16,6 +16,7 @@ from transformers import (
     AutoTokenizer,
     TrainingArguments,
     Trainer,
+    BitsAndBytesConfig,
 )
 from peft import (
     LoraConfig,
@@ -441,4 +442,3 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
-        
