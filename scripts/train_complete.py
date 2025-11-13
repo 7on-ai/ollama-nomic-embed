@@ -263,6 +263,7 @@ def train_complete_lora(
     print(f"👤 User: {user_id}")
     print(f"📦 Base model: {base_model}")
     print(f"📝 Adapter: {adapter_name}")
+    print(f"💾 Output: {output_dir}")
     
     # 1. Fetch all data
     print("\n📊 Fetching data...")
@@ -418,7 +419,9 @@ if __name__ == "__main__":
     base_model = sys.argv[3]
     adapter_name = sys.argv[4]
     
-    output_dir = f"/models/adapters/{user_id}/{adapter_name}"
+    # ✅ FIXED: Use OUTPUT_PATH env or default
+    output_base = os.environ.get('OUTPUT_PATH', '/workspace/adapters')
+    output_dir = f"{output_base}/{user_id}/{adapter_name}"
     os.makedirs(output_dir, exist_ok=True)
     
     try:
