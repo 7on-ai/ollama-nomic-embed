@@ -1,33 +1,31 @@
-FROM ollama/ollama:latest
+# --------------------------------------------------
+# Base image: PyTorch official (CPU only)
+# --------------------------------------------------
+FROM pytorch/pytorch:2.3.1-cpu
 
-# -----------------------------
+# --------------------------------------------------
 # Install system dependencies
-# -----------------------------
+# --------------------------------------------------
 RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-pip \
-    python3-dev \
-    python3-venv \
     git \
     curl \
+    python3-dev \
+    python3-venv \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# -----------------------------
-# Create virtual environment
-# -----------------------------
-ENV VIRTUAL_ENV=/opt/venv
-RUN python3 -m venv $VIRTUAL_ENV
-ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+# --------------------------------------------------
+# Create working directories
+# --------------------------------------------------
+WORKDIR /workspace
+RUN mkdir -p /workspace/scripts /workspace/models/adapters
 
-# -----------------------------
+# --------------------------------------------------
 # Install Python packages
-# -----------------------------
+# --------------------------------------------------
 RUN pip install --no-cache-dir \
-    torch \
     transformers \
     peft \
-    bitsandbytes \
     accelerate \
     datasets \
     psycopg2-binary \
@@ -36,35 +34,29 @@ RUN pip install --no-cache-dir \
     flask-cors \
     gunicorn
 
-# -----------------------------
-# Create directories
-# -----------------------------
-RUN mkdir -p /models/adapters /scripts
+# --------------------------------------------------
+# Copy training script (optional)
+# --------------------------------------------------
+COPY scripts/train_complete.py /workspace/scripts/train_complete.py
+RUN chmod +x /workspace/scripts/train_complete.py
 
-# -----------------------------
-# Copy training script
-# -----------------------------
-COPY scripts/train_complete.py /scripts/train_lora.py
-RUN chmod +x /scripts/train_lora.py
+# --------------------------------------------------
+# Optional: Flask API (if you expose training service)
+# --------------------------------------------------
+COPY app.py /workspace/app.py
 
-# -----------------------------
-# Copy Flask API
-# -----------------------------
-COPY app.py /app.py
+# --------------------------------------------------
+# Entrypoint script (for both job & API)
+# --------------------------------------------------
+COPY entrypoint.sh /workspace/entrypoint.sh
+RUN chmod +x /workspace/entrypoint.sh
 
-# -----------------------------
-# Copy entrypoint script
-# -----------------------------
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-
-# -----------------------------
-# Expose ports
-# -----------------------------
-EXPOSE 11434
+# --------------------------------------------------
+# Expose Flask API port
+# --------------------------------------------------
 EXPOSE 5000
 
-# -----------------------------
-# Entrypoint
-# -----------------------------
-ENTRYPOINT ["/entrypoint.sh"]
+# --------------------------------------------------
+# Default entrypoint
+# --------------------------------------------------
+ENTRYPOINT ["/workspace/entrypoint.sh"]
