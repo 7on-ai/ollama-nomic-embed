@@ -50,6 +50,13 @@ CONFIG = {
     "mcl_weight": 0.3,
 }
 
+# ✅ Model mapping
+MODEL_MAPPING = {
+    'mistral': 'mistralai/Mistral-7B-Instruct-v0.2',
+    'llama': 'meta-llama/Llama-2-7b-chat-hf',
+    'tinyllama': 'TinyLlama/TinyLlama-1.1B-Chat-v1.0',
+}
+
 def fetch_good_channel(postgres_uri: str, user_id: str):
     """Fetch approved good channel data"""
     conn = psycopg2.connect(postgres_uri)
@@ -122,7 +129,7 @@ def create_good_channel_pairs(good_data):
         pairs.append({
             'instruction': 'Respond as helpful personal assistant',
             'input': item['text'],
-            'output': item['text']  # Self-reinforcement
+            'output': item['text']
         })
     return pairs
 
@@ -154,19 +161,16 @@ def prepare_lora_dataset(good_pairs, counterfactual_pairs, mcl_pairs, tokenizer)
     """Mix all datasets according to weights"""
     import random
     
-    # Calculate samples
     total = len(good_pairs) + len(counterfactual_pairs) + len(mcl_pairs)
     
     good_samples = int(total * CONFIG['good_weight'])
     counter_samples = int(total * CONFIG['counterfactual_weight'])
     mcl_samples = int(total * CONFIG['mcl_weight'])
     
-    # Sample
     sampled_good = random.sample(good_pairs, min(good_samples, len(good_pairs)))
     sampled_counter = random.sample(counterfactual_pairs, min(counter_samples, len(counterfactual_pairs)))
     sampled_mcl = random.sample(mcl_pairs, min(mcl_samples, len(mcl_pairs)))
     
-    # Combine
     all_pairs = sampled_good + sampled_counter + sampled_mcl
     random.shuffle(all_pairs)
     
@@ -176,7 +180,6 @@ def prepare_lora_dataset(good_pairs, counterfactual_pairs, mcl_pairs, tokenizer)
     print(f"  MCL: {len(sampled_mcl)}")
     print(f"  Total: {len(all_pairs)}")
     
-    # Format
     texts = [
         f"### Instruction:\n{p['instruction']}\n\n### Input:\n{p['input']}\n\n### Response:\n{p['output']}"
         for p in all_pairs
@@ -197,7 +200,6 @@ def train_detectors(bad_data, output_dir):
     """Train simple detectors for each shadow tag"""
     detectors = {}
     
-    # Group by shadow_tag
     from collections import defaultdict
     by_tag = defaultdict(list)
     
@@ -211,18 +213,14 @@ def train_detectors(bad_data, output_dir):
             print(f"  ⚠️  Skipping {tag} (only {len(texts)} samples)")
             continue
         
-        # Create negative samples (from good channel - simplified)
         negative_samples = ["This is a normal conversation"] * len(texts)
         
-        # Prepare data
         X_texts = texts + negative_samples
         y = [1] * len(texts) + [0] * len(negative_samples)
         
-        # Vectorize
         vectorizer = TfidfVectorizer(max_features=100)
         X = vectorizer.fit_transform(X_texts)
         
-        # Train
         clf = LogisticRegression(max_iter=1000)
         clf.fit(X, y)
         
@@ -234,7 +232,6 @@ def train_detectors(bad_data, output_dir):
         
         print(f"  ✅ {tag}: {len(texts)} samples")
     
-    # Save detectors
     detector_path = f"{output_dir}/detectors.pkl"
     with open(detector_path, 'wb') as f:
         pickle.dump(detectors, f)
@@ -274,33 +271,24 @@ def train_complete_lora(
     print(f"  Bad channel: {len(bad_data)} samples")
     print(f"  MCL chains: {len(mcl_data)} samples")
     
-    # ✅ FIXED: Validate total data AND minimum good data
     total_samples = len(good_data) + len(bad_data) + len(mcl_data)
     
     print(f"\n📊 Validation:")
     print(f"  Total samples: {total_samples}")
     print(f"  Good samples: {len(good_data)}")
     
-    # Check total samples
     if total_samples < 10:
         raise ValueError(
             f"❌ Not enough training data!\n"
             f"   Total: {total_samples} (need at least 10)\n"
-            f"   Breakdown:\n"
-            f"   - Good: {len(good_data)}\n"
-            f"   - Bad: {len(bad_data)}\n"
-            f"   - MCL: {len(mcl_data)}\n"
-            f"\n💡 Add more conversations to reach minimum requirement."
+            f"   Breakdown: Good: {len(good_data)}, Bad: {len(bad_data)}, MCL: {len(mcl_data)}"
         )
     
-    # Check minimum good samples for imitation learning
     if len(good_data) < 5:
         raise ValueError(
-            f"❌ Not enough good channel data for imitation learning!\n"
+            f"❌ Not enough good channel data!\n"
             f"   Good: {len(good_data)} (need at least 5)\n"
-            f"   Total: {total_samples}\n"
-            f"\n💡 Good channel data is essential for quality training.\n"
-            f"   Chat naturally with the AI to generate more positive examples."
+            f"   Total: {total_samples}"
         )
     
     print(f"✅ Validation passed: {total_samples} total, {len(good_data)} good")
@@ -311,22 +299,38 @@ def train_complete_lora(
     counterfactual_pairs = create_counterfactual_pairs(bad_data) if bad_data else []
     mcl_pairs = create_mcl_pairs(mcl_data) if mcl_data else []
     
-    # 3. Train detectors (from bad channel)
+    # 3. Train detectors
     print("\n🔍 Training detectors...")
     detectors = train_detectors(bad_data, output_dir) if bad_data else {}
     
-    # 4. Load model
+    # 4. Load model with proper config
     print("\n🧠 Loading base model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model,
+    
+    # ✅ Resolve model name
+    model_path = MODEL_MAPPING.get(base_model.lower(), base_model)
+    if '/' not in model_path:
+        print(f"⚠️  Unknown model '{base_model}', using TinyLlama")
+        model_path = 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'
+    
+    print(f"📦 Using model: {model_path}")
+    
+    # ✅ BitsAndBytesConfig
+    bnb_config = BitsAndBytesConfig(
         load_in_8bit=True,
+        bnb_8bit_compute_dtype=torch.float16,
+        bnb_8bit_use_double_quant=True,
+    )
+    
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        quantization_config=bnb_config,
         device_map="auto",
         trust_remote_code=True,
     )
     
     model = prepare_model_for_kbit_training(model)
     
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.eos_token
     
     # 5. Setup LoRA
@@ -380,7 +384,7 @@ def train_complete_lora(
     metadata = {
         "user_id": user_id,
         "adapter_name": adapter_name,
-        "base_model": base_model,
+        "base_model": model_path,
         "training_composition": {
             "good_channel": len(good_pairs),
             "counterfactuals": len(counterfactual_pairs),
@@ -442,3 +446,4 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
+        
