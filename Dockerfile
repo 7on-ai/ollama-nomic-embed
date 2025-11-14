@@ -9,8 +9,7 @@ FROM pytorch/pytorch:2.3.1-cpu
 RUN apt-get update && apt-get install -y \
     git \
     curl \
-    python3-dev \
-    python3-venv \
+    build-essential \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -18,10 +17,10 @@ RUN apt-get update && apt-get install -y \
 # Create working directories
 # --------------------------------------------------
 WORKDIR /workspace
-RUN mkdir -p /workspace/scripts /workspace/models/adapters
+RUN mkdir -p /workspace/scripts /workspace/adapters
 
 # --------------------------------------------------
-# Install Python packages
+# Install Python packages (no bitsandbytes for CPU)
 # --------------------------------------------------
 RUN pip install --no-cache-dir \
     transformers \
@@ -29,34 +28,27 @@ RUN pip install --no-cache-dir \
     accelerate \
     datasets \
     psycopg2-binary \
-    scikit-learn \
-    flask \
-    flask-cors \
-    gunicorn
+    scikit-learn
 
 # --------------------------------------------------
-# Copy training script (optional)
+# Copy training script
 # --------------------------------------------------
 COPY scripts/train_complete.py /workspace/scripts/train_complete.py
 RUN chmod +x /workspace/scripts/train_complete.py
 
 # --------------------------------------------------
-# Optional: Flask API (if you expose training service)
-# --------------------------------------------------
-COPY app.py /workspace/app.py
-
-# --------------------------------------------------
-# Entrypoint script (for both job & API)
+# Copy entrypoint script
 # --------------------------------------------------
 COPY entrypoint.sh /workspace/entrypoint.sh
 RUN chmod +x /workspace/entrypoint.sh
 
 # --------------------------------------------------
-# Expose Flask API port
+# Set environment variables
 # --------------------------------------------------
-EXPOSE 5000
+ENV OUTPUT_PATH=/workspace/adapters
+ENV PYTHONUNBUFFERED=1
 
 # --------------------------------------------------
-# Default entrypoint
+# Default entrypoint (Job mode - no Flask)
 # --------------------------------------------------
 ENTRYPOINT ["/workspace/entrypoint.sh"]

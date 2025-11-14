@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-Complete LoRA Training Pipeline
-- Good channel → imitation learning
-- Bad channel → detector training + safe counterfactuals
-- MCL → moral reasoning tasks
+Complete LoRA Training Pipeline with Progress Tracking
 """
 
 import json
@@ -16,12 +13,13 @@ from transformers import (
     AutoTokenizer,
     TrainingArguments,
     Trainer,
-    BitsAndBytesConfig,
+    TrainerCallback,
 )
+import warnings
+warnings.filterwarnings('ignore')
 from peft import (
     LoraConfig,
     get_peft_model,
-    prepare_model_for_kbit_training,
     TaskType,
 )
 from datasets import Dataset
@@ -34,7 +32,6 @@ import gc
 
 # ===== Configuration =====
 CONFIG = {
-    # LoRA
     "r": 8,
     "lora_alpha": 32,
     "lora_dropout": 0.05,
@@ -43,15 +40,32 @@ CONFIG = {
     "num_epochs": 2,
     "batch_size": 1,
     "max_length": 512,
-    
-    # Data mixing ratios
     "good_weight": 0.4,
     "counterfactual_weight": 0.3,
     "mcl_weight": 0.3,
 }
 
+# ===== Progress Callback =====
+class ProgressCallback(TrainerCallback):
+    """Print progress during training"""
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % 10 == 0:
+            progress = (state.global_step / state.max_steps) * 100
+            print(f"📊 Progress: {progress:.1f}% (Step {state.global_step}/{state.max_steps})")
+    
+    def on_epoch_end(self, args, state, control, **kwargs):
+        print(f"✅ Epoch {int(state.epoch)} completed")
+
+def print_step(step_num, title):
+    """Print formatted step header"""
+    print(f"\n{'='*50}")
+    print(f"Step {step_num}: {title}")
+    print('='*50)
+
 def fetch_good_channel(postgres_uri: str, user_id: str):
     """Fetch approved good channel data"""
+    print("  🔍 Connecting to database...")
     conn = psycopg2.connect(postgres_uri)
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     
@@ -69,10 +83,11 @@ def fetch_good_channel(postgres_uri: str, user_id: str):
     cursor.close()
     conn.close()
     
+    print(f"  ✅ Fetched {len(data)} good channel samples")
     return [{'text': row['text'], 'metadata': row['metadata']} for row in data]
 
 def fetch_bad_channel(postgres_uri: str, user_id: str):
-    """Fetch approved bad channel data with counterfactuals"""
+    """Fetch approved bad channel data"""
     conn = psycopg2.connect(postgres_uri)
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     
@@ -91,6 +106,7 @@ def fetch_bad_channel(postgres_uri: str, user_id: str):
     cursor.close()
     conn.close()
     
+    print(f"  ✅ Fetched {len(data)} bad channel samples")
     return data
 
 def fetch_mcl_chains(postgres_uri: str, user_id: str):
@@ -113,6 +129,7 @@ def fetch_mcl_chains(postgres_uri: str, user_id: str):
     cursor.close()
     conn.close()
     
+    print(f"  ✅ Fetched {len(data)} MCL chains")
     return data
 
 def create_good_channel_pairs(good_data):
@@ -122,12 +139,12 @@ def create_good_channel_pairs(good_data):
         pairs.append({
             'instruction': 'Respond as helpful personal assistant',
             'input': item['text'],
-            'output': item['text']  # Self-reinforcement
+            'output': item['text']
         })
     return pairs
 
 def create_counterfactual_pairs(bad_data):
-    """Create safe counterfactual training pairs"""
+    """Create safe counterfactual pairs"""
     pairs = []
     for item in bad_data:
         pairs.append({
@@ -138,45 +155,38 @@ def create_counterfactual_pairs(bad_data):
     return pairs
 
 def create_mcl_pairs(mcl_data):
-    """Create moral reasoning training pairs"""
+    """Create moral reasoning pairs"""
     pairs = []
     for item in mcl_data:
         chain_text = ' → '.join([e['text'] for e in item['event_chain']])
-        
         pairs.append({
-            'instruction': 'Analyze this sequence of events from a moral perspective',
+            'instruction': 'Analyze this sequence from a moral perspective',
             'input': f"Events: {chain_text}\nClassification: {item['moral_classification']}",
-            'output': f"{item['summary']} (Intention: {item['intention_score']:.2f}, Necessity: {item['necessity_score']:.2f})"
+            'output': f"{item['summary']} (Intent: {item['intention_score']:.2f})"
         })
     return pairs
 
 def prepare_lora_dataset(good_pairs, counterfactual_pairs, mcl_pairs, tokenizer):
-    """Mix all datasets according to weights"""
+    """Mix datasets according to weights"""
     import random
     
-    # Calculate samples
     total = len(good_pairs) + len(counterfactual_pairs) + len(mcl_pairs)
     
     good_samples = int(total * CONFIG['good_weight'])
     counter_samples = int(total * CONFIG['counterfactual_weight'])
     mcl_samples = int(total * CONFIG['mcl_weight'])
     
-    # Sample
     sampled_good = random.sample(good_pairs, min(good_samples, len(good_pairs)))
     sampled_counter = random.sample(counterfactual_pairs, min(counter_samples, len(counterfactual_pairs)))
     sampled_mcl = random.sample(mcl_pairs, min(mcl_samples, len(mcl_pairs)))
     
-    # Combine
     all_pairs = sampled_good + sampled_counter + sampled_mcl
     random.shuffle(all_pairs)
     
-    print(f"📊 Dataset composition:")
-    print(f"  Good channel: {len(sampled_good)}")
-    print(f"  Counterfactuals: {len(sampled_counter)}")
-    print(f"  MCL: {len(sampled_mcl)}")
-    print(f"  Total: {len(all_pairs)}")
+    print(f"  📊 Dataset composition:")
+    print(f"     Good: {len(sampled_good)} | Counter: {len(sampled_counter)} | MCL: {len(sampled_mcl)}")
+    print(f"     Total: {len(all_pairs)} training pairs")
     
-    # Format
     texts = [
         f"### Instruction:\n{p['instruction']}\n\n### Input:\n{p['input']}\n\n### Response:\n{p['output']}"
         for p in all_pairs
@@ -194,35 +204,27 @@ def prepare_lora_dataset(good_pairs, counterfactual_pairs, mcl_pairs, tokenizer)
     return dataset.map(tokenize, batched=True)
 
 def train_detectors(bad_data, output_dir):
-    """Train simple detectors for each shadow tag"""
+    """Train simple detectors"""
     detectors = {}
-    
-    # Group by shadow_tag
     from collections import defaultdict
     by_tag = defaultdict(list)
     
     for item in bad_data:
         by_tag[item['shadow_tag']].append(item['text'])
     
-    print(f"🔍 Training detectors for {len(by_tag)} categories")
+    print(f"  🔍 Training {len(by_tag)} detectors...")
     
     for tag, texts in by_tag.items():
         if len(texts) < 5:
-            print(f"  ⚠️  Skipping {tag} (only {len(texts)} samples)")
             continue
         
-        # Create negative samples (from good channel - simplified)
-        negative_samples = ["This is a normal conversation"] * len(texts)
-        
-        # Prepare data
+        negative_samples = ["Normal conversation"] * len(texts)
         X_texts = texts + negative_samples
         y = [1] * len(texts) + [0] * len(negative_samples)
         
-        # Vectorize
         vectorizer = TfidfVectorizer(max_features=100)
         X = vectorizer.fit_transform(X_texts)
         
-        # Train
         clf = LogisticRegression(max_iter=1000)
         clf.fit(X, y)
         
@@ -231,105 +233,81 @@ def train_detectors(bad_data, output_dir):
             'classifier': clf,
             'samples': len(texts)
         }
-        
-        print(f"  ✅ {tag}: {len(texts)} samples")
     
-    # Save detectors
     detector_path = f"{output_dir}/detectors.pkl"
     with open(detector_path, 'wb') as f:
         pickle.dump(detectors, f)
     
-    print(f"💾 Saved {len(detectors)} detectors to {detector_path}")
-    
+    print(f"  ✅ Saved {len(detectors)} detectors")
     return detectors
 
 def cleanup_memory():
-    """Clean up memory after training"""
+    """Clean up memory"""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    print("🧹 Memory cleaned up")
 
-def train_complete_lora(
-    postgres_uri: str,
-    user_id: str,
-    base_model: str,
-    adapter_name: str,
-    output_dir: str
-):
+def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_dir):
     """Complete training pipeline"""
     
-    print(f"🚀 Starting Complete LoRA Training")
+    print("\n" + "="*50)
+    print("🚀 LoRA Training Pipeline Started")
+    print("="*50)
     print(f"👤 User: {user_id}")
-    print(f"📦 Base model: {base_model}")
+    print(f"📦 Model: {base_model}")
     print(f"📝 Adapter: {adapter_name}")
     print(f"💾 Output: {output_dir}")
+    print("="*50)
     
-    # 1. Fetch all data
-    print("\n📊 Fetching data...")
+    # Step 1: Fetch data
+    print_step(1, "Fetching Data")
     good_data = fetch_good_channel(postgres_uri, user_id)
     bad_data = fetch_bad_channel(postgres_uri, user_id)
     mcl_data = fetch_mcl_chains(postgres_uri, user_id)
     
-    print(f"  Good channel: {len(good_data)} samples")
-    print(f"  Bad channel: {len(bad_data)} samples")
-    print(f"  MCL chains: {len(mcl_data)} samples")
-    
-    # ✅ FIXED: Validate total data AND minimum good data
     total_samples = len(good_data) + len(bad_data) + len(mcl_data)
     
-    print(f"\n📊 Validation:")
-    print(f"  Total samples: {total_samples}")
-    print(f"  Good samples: {len(good_data)}")
+    # Validation
+    print("\n  📊 Validation:")
+    print(f"     Total: {total_samples} | Good: {len(good_data)}")
     
-    # Check total samples
     if total_samples < 10:
-        raise ValueError(
-            f"❌ Not enough training data!\n"
-            f"   Total: {total_samples} (need at least 10)\n"
-            f"   Breakdown:\n"
-            f"   - Good: {len(good_data)}\n"
-            f"   - Bad: {len(bad_data)}\n"
-            f"   - MCL: {len(mcl_data)}\n"
-            f"\n💡 Add more conversations to reach minimum requirement."
-        )
+        raise ValueError(f"❌ Need at least 10 samples (have {total_samples})")
     
-    # Check minimum good samples for imitation learning
     if len(good_data) < 5:
-        raise ValueError(
-            f"❌ Not enough good channel data for imitation learning!\n"
-            f"   Good: {len(good_data)} (need at least 5)\n"
-            f"   Total: {total_samples}\n"
-            f"\n💡 Good channel data is essential for quality training.\n"
-            f"   Chat naturally with the AI to generate more positive examples."
-        )
+        raise ValueError(f"❌ Need at least 5 good samples (have {len(good_data)})")
     
-    print(f"✅ Validation passed: {total_samples} total, {len(good_data)} good")
+    print("  ✅ Validation passed")
     
-    # 2. Create training pairs
-    print("\n📝 Creating training pairs...")
+    # Step 2: Create pairs
+    print_step(2, "Creating Training Pairs")
     good_pairs = create_good_channel_pairs(good_data)
     counterfactual_pairs = create_counterfactual_pairs(bad_data) if bad_data else []
     mcl_pairs = create_mcl_pairs(mcl_data) if mcl_data else []
+    print(f"  ✅ Created {len(good_pairs) + len(counterfactual_pairs) + len(mcl_pairs)} pairs")
     
-    # 3. Train detectors (from bad channel)
-    print("\n🔍 Training detectors...")
-    detectors = train_detectors(bad_data, output_dir) if bad_data else {}
+    # Step 3: Train detectors
+    if bad_data:
+        print_step(3, "Training Detectors")
+        detectors = train_detectors(bad_data, output_dir)
+    else:
+        detectors = {}
+        print_step(3, "Skipping Detectors (no bad data)")
     
-    # 4. Load model
-    print("\n🧠 Loading base model...")
+    # Step 4: Load model
+    print_step(4, "Loading Base Model")
+    print(f"  📥 Loading {base_model}...")
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
         device_map="auto",
         trust_remote_code=True,
     )
-
-    
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     tokenizer.pad_token = tokenizer.eos_token
+    print("  ✅ Model loaded")
     
-    # 5. Setup LoRA
-    print("\n⚙️  Configuring LoRA...")
+    # Step 5: Setup LoRA
+    print_step(5, "Configuring LoRA")
     lora_config = LoraConfig(
         r=CONFIG["r"],
         lora_alpha=CONFIG["lora_alpha"],
@@ -338,16 +316,15 @@ def train_complete_lora(
         bias="none",
         task_type=TaskType.CAUSAL_LM,
     )
-    
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
     
-    # 6. Prepare dataset
-    print("\n📝 Preparing mixed dataset...")
+    # Step 6: Prepare dataset
+    print_step(6, "Preparing Dataset")
     dataset = prepare_lora_dataset(good_pairs, counterfactual_pairs, mcl_pairs, tokenizer)
     
-    # 7. Training
-    print("\n🏋️  Training LoRA...")
+    # Step 7: Training
+    print_step(7, "Training LoRA Adapter")
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=CONFIG["num_epochs"],
@@ -363,18 +340,20 @@ def train_complete_lora(
         model=model,
         args=training_args,
         train_dataset=dataset,
+        callbacks=[ProgressCallback()],
     )
     
+    print("\n  🏋️  Starting training...")
     result = trainer.train()
     
-    # 8. Save
-    print("\n💾 Saving artifacts...")
+    # Step 8: Save
+    print_step(8, "Saving Artifacts")
     model.save_pretrained(output_dir)
+    print("  ✅ Model saved")
     
-    # 9. Clean up memory
     cleanup_memory()
     
-    # 10. Metadata
+    # Step 9: Metadata
     metadata = {
         "user_id": user_id,
         "adapter_name": adapter_name,
@@ -402,10 +381,14 @@ def train_complete_lora(
     with open(f"{output_dir}/metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
     
-    print("\n✅ Training completed!")
+    print("\n" + "="*50)
+    print("✅ Training Completed Successfully!")
+    print("="*50)
     print(f"📊 Final loss: {result.training_loss:.4f}")
-    print(f"🔍 Detectors: {len(detectors)} categories")
-    print(f"📈 Total samples used: {total_samples}")
+    print(f"🔍 Detectors: {len(detectors)}")
+    print(f"📈 Samples: {total_samples}")
+    print(f"📁 Output: {output_dir}")
+    print("="*50 + "\n")
     
     return metadata
 
@@ -419,7 +402,6 @@ if __name__ == "__main__":
     base_model = sys.argv[3]
     adapter_name = sys.argv[4]
     
-    # ✅ FIXED: Use OUTPUT_PATH env or default
     output_base = os.environ.get('OUTPUT_PATH', '/workspace/adapters')
     output_dir = f"{output_base}/{user_id}/{adapter_name}"
     os.makedirs(output_dir, exist_ok=True)
@@ -433,12 +415,12 @@ if __name__ == "__main__":
             output_dir=output_dir,
         )
         
-        print("\n===METADATA_START===")
+        print("===METADATA_START===")
         print(json.dumps(metadata))
         print("===METADATA_END===")
         
     except Exception as e:
-        print(f"❌ Training failed: {str(e)}", file=sys.stderr)
+        print(f"\n❌ Training failed: {str(e)}", file=sys.stderr)
         import traceback
         traceback.print_exc()
         sys.exit(1)

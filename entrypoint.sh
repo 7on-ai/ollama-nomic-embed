@@ -1,44 +1,77 @@
 #!/bin/bash
 set -e
 
-echo "🚀 Starting LoRA Training Job..."
+echo "=========================================="
+echo "🚀 LoRA Training Job Started"
+echo "=========================================="
+echo "📅 Time: $(date)"
+echo "💻 Hostname: $(hostname)"
+echo "📂 Working dir: $(pwd)"
+echo "=========================================="
 
-# Required ENV
-if [ -z "$POSTGRES_URI" ] || [ -z "$USER_ID" ] || [ -z "$BASE_MODEL" ]; then
-  echo "❌ Missing required environment variables:"
-  echo "   POSTGRES_URI, USER_ID, BASE_MODEL are required."
+# ===== Validate Environment Variables =====
+echo ""
+echo "📋 Validating environment variables..."
+
+if [ -z "$POSTGRES_URI" ]; then
+  echo "❌ ERROR: POSTGRES_URI is not set"
   exit 1
 fi
 
-# Adapter name (auto generate if not provided)
-ADAPTER_NAME=${ADAPTER_NAME:-"lora_$(date +%s)"}
+if [ -z "$USER_ID" ]; then
+  echo "❌ ERROR: USER_ID is not set"
+  exit 1
+fi
 
-# Output directory
-OUTPUT_DIR="/workspace/models/adapters/${USER_ID}/${ADAPTER_NAME}"
+if [ -z "$MODEL_NAME" ]; then
+  echo "❌ ERROR: MODEL_NAME is not set"
+  exit 1
+fi
+
+echo "✅ All required environment variables are set"
+
+# ===== Generate Adapter Version =====
+ADAPTER_VERSION=${ADAPTER_VERSION:-"v$(date +%s)"}
+
+# ===== Set Output Directory =====
+OUTPUT_DIR="${OUTPUT_PATH:-/workspace/adapters}/${USER_ID}/${ADAPTER_VERSION}"
 mkdir -p "$OUTPUT_DIR"
 
-echo "📦 Environment setup:"
-echo "   USER_ID:        $USER_ID"
-echo "   BASE_MODEL:     $BASE_MODEL"
-echo "   ADAPTER_NAME:   $ADAPTER_NAME"
-echo "   OUTPUT_DIR:     $OUTPUT_DIR"
-echo "   POSTGRES_URI:   [hidden]"
+echo ""
+echo "📦 Configuration:"
+echo "   USER_ID:         $USER_ID"
+echo "   MODEL_NAME:      $MODEL_NAME"
+echo "   ADAPTER_VERSION: $ADAPTER_VERSION"
+echo "   OUTPUT_DIR:      $OUTPUT_DIR"
+echo "   POSTGRES_URI:    [hidden for security]"
+echo "=========================================="
 
-# Run training
+# ===== Run Training Script =====
+echo ""
+echo "🏋️  Starting training..."
+echo "=========================================="
+
 python3 /workspace/scripts/train_complete.py \
     "$POSTGRES_URI" \
     "$USER_ID" \
-    "$BASE_MODEL" \
-    "$ADAPTER_NAME"
+    "$MODEL_NAME" \
+    "$ADAPTER_VERSION"
 
-# Check result
+# ===== Check Result =====
 if [ $? -eq 0 ]; then
-    echo "✅ Training completed successfully."
-    echo "📁 Output stored at: $OUTPUT_DIR"
+    echo ""
+    echo "=========================================="
+    echo "✅ Training completed successfully!"
+    echo "=========================================="
+    echo "📁 Output location: $OUTPUT_DIR"
+    echo "📊 Files created:"
+    ls -lh "$OUTPUT_DIR"
+    echo "=========================================="
+    exit 0
 else
-    echo "❌ Training failed."
+    echo ""
+    echo "=========================================="
+    echo "❌ Training failed!"
+    echo "=========================================="
     exit 1
 fi
-
-# Optional: keep container alive for inspection (comment out if not needed)
-# tail -f /dev/null
