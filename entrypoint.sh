@@ -30,11 +30,11 @@ fi
 
 echo "✅ All required environment variables are set"
 
-# ===== Generate Adapter Version =====
-ADAPTER_VERSION=${ADAPTER_VERSION:-"v$(date +%s)"}
+# ===== Generate and Export Adapter Version =====
+export ADAPTER_VERSION=${ADAPTER_VERSION:-"v$(date +%s)"}
 
-# ===== Set Output Directory =====
-OUTPUT_DIR="${OUTPUT_PATH:-/workspace/adapters}/${USER_ID}/${ADAPTER_VERSION}"
+# ===== Set and Export Output Directory =====
+export OUTPUT_DIR="${OUTPUT_PATH:-/workspace/adapters}/${USER_ID}/${ADAPTER_VERSION}"
 mkdir -p "$OUTPUT_DIR"
 
 echo ""
@@ -51,11 +51,7 @@ echo ""
 echo "🏋️  Starting training..."
 echo "=========================================="
 
-python3 /workspace/scripts/train_complete.py \
-    "$POSTGRES_URI" \
-    "$USER_ID" \
-    "$MODEL_NAME" \
-    "$ADAPTER_VERSION"
+python3 /workspace/scripts/train_complete.py
 
 # ===== Check Result =====
 if [ $? -eq 0 ]; then

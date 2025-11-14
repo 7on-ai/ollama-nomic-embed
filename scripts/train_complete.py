@@ -393,14 +393,20 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
     return metadata
 
 if __name__ == "__main__":
-    if len(sys.argv) < 5:
-        print("Usage: python train_complete.py <postgres_uri> <user_id> <base_model> <adapter_name>")
-        sys.exit(1)
+    # Read from environment variables (injected by Northflank)
+    postgres_uri = os.environ.get('POSTGRES_URI')
+    user_id = os.environ.get('USER_ID')
+    base_model = os.environ.get('MODEL_NAME')
+    adapter_name = os.environ.get('ADAPTER_VERSION')
     
-    postgres_uri = sys.argv[1]
-    user_id = sys.argv[2]
-    base_model = sys.argv[3]
-    adapter_name = sys.argv[4]
+    # Validation
+    if not all([postgres_uri, user_id, base_model, adapter_name]):
+        print("❌ Missing required environment variables", file=sys.stderr)
+        print(f"POSTGRES_URI: {'✓' if postgres_uri else '✗'}")
+        print(f"USER_ID: {'✓' if user_id else '✗'}")
+        print(f"MODEL_NAME: {'✓' if base_model else '✗'}")
+        print(f"ADAPTER_VERSION: {'✓' if adapter_name else '✗'}")
+        sys.exit(1)
     
     output_base = os.environ.get('OUTPUT_PATH', '/workspace/adapters')
     output_dir = f"{output_base}/{user_id}/{adapter_name}"
