@@ -1,7 +1,7 @@
 # --------------------------------------------------
 # Base image: PyTorch official (CPU only)
 # --------------------------------------------------
-FROM pytorch/pytorch:2.3.1-cpu
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
 
 # --------------------------------------------------
 # Install system dependencies
