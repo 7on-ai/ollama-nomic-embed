@@ -1,7 +1,7 @@
 # --------------------------------------------------
-# Base image: PyTorch official (CPU only)
+# Base image: PyTorch official (newer version)
 # --------------------------------------------------
-FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+FROM pytorch/pytorch:2.2.0-cuda11.8-cudnn8-runtime
 
 # --------------------------------------------------
 # Install system dependencies
@@ -20,15 +20,16 @@ WORKDIR /workspace
 RUN mkdir -p /workspace/scripts /workspace/adapters
 
 # --------------------------------------------------
-# Install Python packages (no bitsandbytes for CPU)
+# Install Python packages (with version pins)
 # --------------------------------------------------
 RUN pip install --no-cache-dir \
-    transformers \
-    peft \
-    accelerate \
-    datasets \
-    psycopg2-binary \
-    scikit-learn
+    torch==2.2.0 \
+    transformers==4.38.0 \
+    peft==0.8.0 \
+    accelerate==0.27.0 \
+    datasets==2.17.0 \
+    psycopg2-binary==2.9.9 \
+    scikit-learn==1.4.0
 
 # --------------------------------------------------
 # Copy training script
