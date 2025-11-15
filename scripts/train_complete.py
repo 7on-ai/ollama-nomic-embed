@@ -321,25 +321,15 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
     print_step(4, "Loading Base Model")
     print(f"  📥 Loading {base_model}...")
     
-    # ✅ Load with 8-bit quantization if available
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            load_in_8bit=True,  # ✅ Reduce memory by ~50%
-            device_map="auto",
-            trust_remote_code=True,
-            torch_dtype=torch.float16,  # ✅ Use half precision
-        )
-        print("  ✅ Model loaded with 8-bit quantization")
-    except Exception as e:
-        print(f"  ⚠️  8-bit loading failed, using float16: {e}")
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            device_map="auto",
-            trust_remote_code=True,
-            torch_dtype=torch.float16,
-        )
-        print("  ✅ Model loaded with float16")
+    # ✅ Load with float16 (8-bit requires extra packages)
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.float16,  # ✅ Use half precision
+        low_cpu_mem_usage=True,  # ✅ Reduce memory during loading
+    )
+    print("  ✅ Model loaded with float16")
     
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     tokenizer.pad_token = tokenizer.eos_token
