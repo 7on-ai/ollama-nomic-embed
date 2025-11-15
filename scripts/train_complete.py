@@ -361,19 +361,24 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
     
     # Step 7: Training with memory optimization
     print_step(7, "Training LoRA Adapter")
+    
+    # ✅ Check if CUDA available
+    use_cuda = torch.cuda.is_available()
+    print(f"  🖥️  Device: {'CUDA (GPU)' if use_cuda else 'CPU'}")
+    
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=CONFIG["num_epochs"],
         per_device_train_batch_size=CONFIG["batch_size"],
-        gradient_accumulation_steps=CONFIG["gradient_accumulation_steps"],  # ✅ Effective batch = 1 * 4 = 4
+        gradient_accumulation_steps=CONFIG["gradient_accumulation_steps"],
         learning_rate=CONFIG["learning_rate"],
         logging_steps=10,
         save_strategy="epoch",
         save_total_limit=1,
         report_to="none",
-        fp16=True,  # ✅ Use mixed precision
-        gradient_checkpointing=True,  # ✅ Save memory during backprop
-        optim="adamw_torch",  # ✅ Memory-efficient optimizer
+        fp16=use_cuda,  # ✅ Only use fp16 if GPU available
+        gradient_checkpointing=True,
+        optim="adamw_torch",
     )
     
     trainer = Trainer(
