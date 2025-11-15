@@ -194,15 +194,19 @@ def prepare_lora_dataset(good_pairs, counterfactual_pairs, mcl_pairs, tokenizer)
     ]
     
     def tokenize(examples):
-        return tokenizer(
+        # ✅ Tokenize and create labels
+        result = tokenizer(
             examples["text"],
             truncation=True,
             max_length=CONFIG["max_length"],
             padding="max_length",
         )
+        # ✅ Add labels (same as input_ids for causal LM)
+        result["labels"] = result["input_ids"].copy()
+        return result
     
     dataset = Dataset.from_dict({"text": texts})
-    return dataset.map(tokenize, batched=True)
+    return dataset.map(tokenize, batched=True, remove_columns=["text"])
 
 def train_detectors(bad_data, output_dir):
     """Train simple detectors"""
@@ -389,7 +393,10 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
     )
     
     print("\n  🏋️  Starting training...")
-    print(f"  💾 Memory optimizations enabled: 8bit/fp16 + gradient checkpointing")
+    if use_cuda:
+        print(f"  💾 Memory optimizations: fp16 + gradient checkpointing")
+    else:
+        print(f"  💾 Memory optimizations: gradient checkpointing (CPU mode)")
     
     result = trainer.train()
     
