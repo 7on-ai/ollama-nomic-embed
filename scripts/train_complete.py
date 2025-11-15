@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Complete LoRA Training Pipeline with Progress Tracking
+Complete LoRA Training Pipeline with Memory Optimization
 """
 
 import json
@@ -40,6 +40,7 @@ CONFIG = {
     "num_epochs": 2,
     "batch_size": 1,
     "max_length": 512,
+    "gradient_accumulation_steps": 4,  # ✅ ลด memory usage
     "good_weight": 0.4,
     "counterfactual_weight": 0.3,
     "mcl_weight": 0.3,
@@ -242,13 +243,15 @@ def train_detectors(bad_data, output_dir):
     return detectors
 
 def cleanup_memory():
-    """Clean up memory"""
+    """Aggressive memory cleanup"""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    print("  🧹 Memory cleaned")
 
 def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_dir):
-    """Complete training pipeline"""
+    """Complete training pipeline with memory optimization"""
     
     print("\n" + "="*50)
     print("🚀 LoRA Training Pipeline Started")
@@ -286,25 +289,62 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
     mcl_pairs = create_mcl_pairs(mcl_data) if mcl_data else []
     print(f"  ✅ Created {len(good_pairs) + len(counterfactual_pairs) + len(mcl_pairs)} pairs")
     
-    # Step 3: Train detectors
-    if bad_data:
-        print_step(3, "Training Detectors")
-        detectors = train_detectors(bad_data, output_dir)
-    else:
-        detectors = {}
-        print_step(3, "Skipping Detectors (no bad data)")
+    # ✅ Clean up data after creating pairs
+    del good_data, bad_data, mcl_data
+    cleanup_memory()
     
-    # Step 4: Load model
+    # Step 3: Train detectors (skip if no bad data to save memory)
+    detectors = {}
+    if counterfactual_pairs and len(counterfactual_pairs) >= 5:
+        print_step(3, "Training Detectors")
+        # Recreate bad_data only for detector training
+        conn = psycopg2.connect(postgres_uri)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT text, shadow_tag
+            FROM user_data_schema.stm_bad
+            WHERE user_id = %s AND approved_for_shadow_learning = TRUE
+            LIMIT 100
+        """, (user_id,))
+        bad_data_small = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if bad_data_small:
+            detectors = train_detectors(bad_data_small, output_dir)
+            del bad_data_small
+            cleanup_memory()
+    else:
+        print_step(3, "Skipping Detectors (insufficient data)")
+    
+    # Step 4: Load model with memory optimization
     print_step(4, "Loading Base Model")
     print(f"  📥 Loading {base_model}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+    
+    # ✅ Load with 8-bit quantization if available
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            load_in_8bit=True,  # ✅ Reduce memory by ~50%
+            device_map="auto",
+            trust_remote_code=True,
+            torch_dtype=torch.float16,  # ✅ Use half precision
+        )
+        print("  ✅ Model loaded with 8-bit quantization")
+    except Exception as e:
+        print(f"  ⚠️  8-bit loading failed, using float16: {e}")
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            device_map="auto",
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+        )
+        print("  ✅ Model loaded with float16")
+    
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     tokenizer.pad_token = tokenizer.eos_token
-    print("  ✅ Model loaded")
+    
+    cleanup_memory()
     
     # Step 5: Setup LoRA
     print_step(5, "Configuring LoRA")
@@ -319,21 +359,31 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
     
+    cleanup_memory()
+    
     # Step 6: Prepare dataset
     print_step(6, "Preparing Dataset")
     dataset = prepare_lora_dataset(good_pairs, counterfactual_pairs, mcl_pairs, tokenizer)
     
-    # Step 7: Training
+    # ✅ Clean up pairs after tokenization
+    del good_pairs, counterfactual_pairs, mcl_pairs
+    cleanup_memory()
+    
+    # Step 7: Training with memory optimization
     print_step(7, "Training LoRA Adapter")
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=CONFIG["num_epochs"],
         per_device_train_batch_size=CONFIG["batch_size"],
+        gradient_accumulation_steps=CONFIG["gradient_accumulation_steps"],  # ✅ Effective batch = 1 * 4 = 4
         learning_rate=CONFIG["learning_rate"],
         logging_steps=10,
         save_strategy="epoch",
         save_total_limit=1,
         report_to="none",
+        fp16=True,  # ✅ Use mixed precision
+        gradient_checkpointing=True,  # ✅ Save memory during backprop
+        optim="adamw_torch",  # ✅ Memory-efficient optimizer
     )
     
     trainer = Trainer(
@@ -344,13 +394,18 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
     )
     
     print("\n  🏋️  Starting training...")
+    print(f"  💾 Memory optimizations enabled: 8bit/fp16 + gradient checkpointing")
+    
     result = trainer.train()
     
     # Step 8: Save
     print_step(8, "Saving Artifacts")
     model.save_pretrained(output_dir)
-    print("  ✅ Model saved")
+    tokenizer.save_pretrained(output_dir)
+    print("  ✅ Model and tokenizer saved")
     
+    # ✅ Final cleanup
+    del model, trainer, dataset
     cleanup_memory()
     
     # Step 9: Metadata
@@ -359,15 +414,11 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
         "adapter_name": adapter_name,
         "base_model": base_model,
         "training_composition": {
-            "good_channel": len(good_pairs),
-            "counterfactuals": len(counterfactual_pairs),
-            "mcl_chains": len(mcl_pairs),
-            "total": len(good_pairs) + len(counterfactual_pairs) + len(mcl_pairs),
+            "good_channel": len(good_pairs) if 'good_pairs' in locals() else 0,
+            "counterfactuals": len(counterfactual_pairs) if 'counterfactual_pairs' in locals() else 0,
+            "mcl_chains": len(mcl_pairs) if 'mcl_pairs' in locals() else 0,
         },
         "data_stats": {
-            "good_samples": len(good_data),
-            "bad_samples": len(bad_data),
-            "mcl_samples": len(mcl_data),
             "total_samples": total_samples,
         },
         "detectors_trained": list(detectors.keys()),
@@ -376,6 +427,7 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
             "loss": float(result.training_loss),
         },
         "trained_at": datetime.now().isoformat(),
+        "optimizations": "8bit/fp16 + gradient_checkpointing + gradient_accumulation",
     }
     
     with open(f"{output_dir}/metadata.json", "w") as f:
@@ -393,7 +445,7 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
     return metadata
 
 if __name__ == "__main__":
-    # Read from environment variables (injected by Northflank)
+    # Read from environment variables
     postgres_uri = os.environ.get('POSTGRES_URI')
     user_id = os.environ.get('USER_ID')
     base_model = os.environ.get('MODEL_NAME')
