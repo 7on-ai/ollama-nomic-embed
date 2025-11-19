@@ -41,10 +41,12 @@ CONFIG = {
     "batch_size": 1,
     "max_length": 512,
     "gradient_accumulation_steps": 4,
-    # ✅ NEW: Weights by classification
-    "growth_weight": 0.4,      # growth_memory + wisdom_moment
-    "challenge_weight": 0.3,   # challenge_memory
-    "wisdom_weight": 0.3,      # wisdom_moment (extra weight)
+    # ✅ Weights by classification (7 types)
+    "growth_weight": 0.30,       # growth_memory
+    "challenge_weight": 0.25,    # challenge_memory
+    "wisdom_weight": 0.25,       # wisdom_moment
+    "neutral_weight": 0.15,      # neutral_interaction (NEW!)
+    "support_weight": 0.05,      # needs_support (minimal, for awareness)
     "min_samples_total": 10,
 }
 
