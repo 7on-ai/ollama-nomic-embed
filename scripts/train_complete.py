@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Patched CPU-compatible LoRA training pipeline
-- Model default: TinyLlama/TinyLlama-1.1B-Chat-v1.0
-- DB schema mapped to stm_good, stm_bad, mcl_chains (user_data_schema)
-- LoRA target modules: ["q_proj","k_proj","v_proj","o_proj"] (full attention)
-- CPU-only mode: torch.float32, fp16=False
+LoRA Training Pipeline - Ethical Growth System
+- Uses interaction_memories table (NEW)
+- Maps classifications: growth_memory, challenge_memory, wisdom_moment
+- CPU-compatible: torch.float32, fp16=False
 """
 
 import os
@@ -31,11 +30,6 @@ from datasets import Dataset
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# Optional detector training libs (lightweight)
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-import pickle
-
 # ===== Configuration =====
 CONFIG = {
     "r": 8,
@@ -47,9 +41,10 @@ CONFIG = {
     "batch_size": 1,
     "max_length": 512,
     "gradient_accumulation_steps": 4,
-    "good_weight": 0.4,
-    "counterfactual_weight": 0.3,
-    "mcl_weight": 0.3,
+    # ✅ NEW: Weights by classification
+    "growth_weight": 0.4,      # growth_memory + wisdom_moment
+    "challenge_weight": 0.3,   # challenge_memory
+    "wisdom_weight": 0.3,      # wisdom_moment (extra weight)
     "min_samples_total": 10,
 }
 
@@ -76,173 +71,190 @@ def print_step(step_num, title):
     print(f"Step {step_num}: {title}")
     print("="*60)
 
-# ===== Database fetchers (map to schema from script1) =====
-def fetch_good_channel(postgres_uri: str, user_id: str, limit: int = 500):
-    print("  🔍 Connecting to DB for stm_good...")
-    conn = psycopg2.connect(postgres_uri)
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    query = """
-    SELECT text, metadata
-    FROM user_data_schema.stm_good
-    WHERE user_id = %s
-      AND approved_for_consolidation = TRUE
-    ORDER BY created_at DESC
-    LIMIT %s
-    """
-    cursor.execute(query, (user_id, limit))
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    print(f"  ✅ Fetched {len(rows)} good samples")
-    return [{'text': r['text'], 'metadata': r.get('metadata')} for r in rows]
+# ===== Database Fetchers (NEW SYSTEM) =====
 
-def fetch_bad_channel(postgres_uri: str, user_id: str, limit: int = 500):
-    print("  🔍 Connecting to DB for stm_bad...")
+def fetch_interaction_memories(postgres_uri: str, user_id: str, classification: str = None, limit: int = 500):
+    """Fetch from interaction_memories table"""
+    print(f"  🔍 Connecting to DB for interaction_memories (classification: {classification or 'all'})...")
     conn = psycopg2.connect(postgres_uri)
     cursor = conn.cursor(cursor_factory=RealDictCursor)
-    query = """
-    SELECT text, shadow_tag, safe_counterfactual, severity_score
-    FROM user_data_schema.stm_bad
-    WHERE user_id = %s
-      AND approved_for_shadow_learning = TRUE
-      AND safe_counterfactual IS NOT NULL
-    ORDER BY created_at DESC
-    LIMIT %s
-    """
-    cursor.execute(query, (user_id, limit))
+    
+    if classification:
+        query = """
+        SELECT text, classification, ethical_scores, gentle_guidance, reflection_prompt, training_weight
+        FROM user_data_schema.interaction_memories
+        WHERE user_id = %s
+          AND classification = %s
+          AND approved_for_training = TRUE
+        ORDER BY created_at DESC
+        LIMIT %s
+        """
+        cursor.execute(query, (user_id, classification, limit))
+    else:
+        query = """
+        SELECT text, classification, ethical_scores, gentle_guidance, reflection_prompt, training_weight
+        FROM user_data_schema.interaction_memories
+        WHERE user_id = %s
+          AND approved_for_training = TRUE
+        ORDER BY created_at DESC
+        LIMIT %s
+        """
+        cursor.execute(query, (user_id, limit))
+    
     rows = cursor.fetchall()
     cursor.close()
     conn.close()
-    print(f"  ✅ Fetched {len(rows)} bad samples")
+    print(f"  ✅ Fetched {len(rows)} samples")
     return rows
 
-def fetch_mcl_chains(postgres_uri: str, user_id: str, limit: int = 200):
-    print("  🔍 Connecting to DB for mcl_chains...")
+def fetch_ethical_profile(postgres_uri: str, user_id: str):
+    """Fetch user's ethical profile"""
     conn = psycopg2.connect(postgres_uri)
     cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
     query = """
-    SELECT event_chain, moral_classification, summary,
-           intention_score, necessity_score, harm_score, benefit_score
-    FROM user_data_schema.mcl_chains
+    SELECT 
+        growth_stage,
+        self_awareness,
+        emotional_regulation,
+        compassion,
+        integrity,
+        growth_mindset,
+        wisdom,
+        transcendence,
+        total_interactions,
+        breakthrough_moments
+    FROM user_data_schema.ethical_profiles
     WHERE user_id = %s
-      AND approved_for_training = TRUE
-    ORDER BY created_at DESC
-    LIMIT %s
     """
-    cursor.execute(query, (user_id, limit))
-    rows = cursor.fetchall()
+    cursor.execute(query, (user_id,))
+    row = cursor.fetchone()
     cursor.close()
     conn.close()
-    print(f"  ✅ Fetched {len(rows)} MCL chains")
-    return rows
+    return row
 
-# ===== Data pair creation (adapted from script1 & script2) =====
-def create_good_channel_pairs(good_data):
+# ===== Data Pair Creation =====
+
+def create_training_pairs(memories):
+    """Create instruction-input-output pairs from interaction_memories"""
     pairs = []
-    for item in good_data:
-        pairs.append({
-            'instruction': 'Respond as helpful personal assistant',
-            'input': item['text'],
-            'output': item['text']
-        })
+    
+    for item in memories:
+        classification = item['classification']
+        text = item['text']
+        
+        if classification == 'growth_memory':
+            pairs.append({
+                'instruction': 'Respond as helpful personal assistant supporting growth',
+                'input': text,
+                'output': text
+            })
+        
+        elif classification == 'challenge_memory':
+            # Use gentle_guidance if available
+            output = item.get('gentle_guidance') or f"I understand this is challenging. {text}"
+            pairs.append({
+                'instruction': 'Respond with compassion to a challenge',
+                'input': text,
+                'output': output
+            })
+        
+        elif classification == 'wisdom_moment':
+            # Add reflection prompt if available
+            reflection = item.get('reflection_prompt', '')
+            output = f"{text}\n\n💭 {reflection}" if reflection else text
+            pairs.append({
+                'instruction': 'Share wisdom and insight',
+                'input': text,
+                'output': output
+            })
+        
+        elif classification == 'needs_support':
+            # Crisis support (should rarely be approved, but handle gracefully)
+            pairs.append({
+                'instruction': 'Provide supportive response',
+                'input': text,
+                'output': item.get('gentle_guidance') or "I care about you. Please reach out for support."
+            })
+    
     return pairs
 
-def create_counterfactual_pairs(bad_data):
-    pairs = []
-    for item in bad_data:
-        # safe_counterfactual expected present per fetch query
-        pairs.append({
-            'instruction': 'Respond safely to potentially harmful request',
-            'input': item['text'],
-            'output': item['safe_counterfactual']
-        })
-    return pairs
-
-def create_mcl_pairs(mcl_data):
-    pairs = []
-    for item in mcl_data:
-        # event_chain assumed to be list of dicts with 'text' key (as in script1)
-        try:
-            chain_text = ' → '.join([e['text'] for e in item['event_chain']])
-        except Exception:
-            # fallback if event_chain is stored as text
-            chain_text = str(item.get('event_chain', ''))
-        pairs.append({
-            'instruction': 'Analyze this sequence from a moral perspective',
-            'input': f"Events: {chain_text}\nClassification: {item.get('moral_classification')}",
-            'output': f"{item.get('summary', '')} (Intent: {item.get('intention_score', 0):.2f})"
-        })
-    return pairs
-
-def prepare_lora_dataset(good_pairs, counterfactual_pairs, mcl_pairs, tokenizer):
-    total = len(good_pairs) + len(counterfactual_pairs) + len(mcl_pairs)
-    if total == 0:
+def prepare_lora_dataset(memories, tokenizer):
+    """Prepare dataset from interaction_memories"""
+    if not memories:
         return None
-
-    good_samples = int(total * CONFIG['good_weight'])
-    counter_samples = int(total * CONFIG['counterfactual_weight'])
-    mcl_samples = int(total * CONFIG['mcl_weight'])
-
-    sampled_good = random.sample(good_pairs, min(good_samples or 1, len(good_pairs))) if good_pairs else []
-    sampled_counter = random.sample(counterfactual_pairs, min(counter_samples or 1, len(counterfactual_pairs))) if counterfactual_pairs else []
-    sampled_mcl = random.sample(mcl_pairs, min(mcl_samples or 1, len(mcl_pairs))) if mcl_pairs else []
-
-    all_pairs = sampled_good + sampled_counter + sampled_mcl
+    
+    # Group by classification
+    by_class = {
+        'growth_memory': [],
+        'challenge_memory': [],
+        'wisdom_moment': [],
+        'needs_support': []
+    }
+    
+    for mem in memories:
+        cls = mem['classification']
+        if cls in by_class:
+            by_class[cls].append(mem)
+    
+    # Calculate sampling
+    total = len(memories)
+    growth_count = len(by_class['growth_memory']) + len(by_class['wisdom_moment'])
+    challenge_count = len(by_class['challenge_memory'])
+    wisdom_extra = len(by_class['wisdom_moment'])
+    
+    # Sample with weights
+    growth_samples = int(total * CONFIG['growth_weight'])
+    challenge_samples = int(total * CONFIG['challenge_weight'])
+    wisdom_samples = int(total * CONFIG['wisdom_weight'])
+    
+    sampled = []
+    
+    # Sample growth + wisdom
+    growth_pool = by_class['growth_memory'] + by_class['wisdom_moment']
+    if growth_pool:
+        sampled.extend(random.sample(growth_pool, min(growth_samples, len(growth_pool))))
+    
+    # Sample challenges
+    if by_class['challenge_memory']:
+        sampled.extend(random.sample(by_class['challenge_memory'], 
+                                     min(challenge_samples, len(by_class['challenge_memory']))))
+    
+    # Sample extra wisdom (for depth)
+    if by_class['wisdom_moment']:
+        sampled.extend(random.sample(by_class['wisdom_moment'], 
+                                     min(wisdom_samples, len(by_class['wisdom_moment']))))
+    
+    # Create pairs
+    all_pairs = create_training_pairs(sampled)
     random.shuffle(all_pairs)
-
+    
     print(f"  📊 Dataset composition:")
-    print(f"     Good: {len(sampled_good)} | Counter: {len(sampled_counter)} | MCL: {len(sampled_mcl)}")
-    print(f"     Total: {len(all_pairs)} training pairs")
-
+    print(f"     Growth: {len(by_class['growth_memory'])} | Challenge: {len(by_class['challenge_memory'])} | Wisdom: {len(by_class['wisdom_moment'])}")
+    print(f"     Total pairs: {len(all_pairs)}")
+    
+    # Tokenize
     texts = [
         f"{p['instruction']}\n\n{p['input']}\n\n{p['output']}{tokenizer.eos_token}"
         for p in all_pairs
     ]
-
+    
     dataset = Dataset.from_dict({"text": texts})
-
+    
     def tokenize_function(examples):
         return tokenizer(
             examples["text"],
             truncation=True,
             max_length=CONFIG["max_length"],
         )
-
+    
     tokenized_dataset = dataset.map(
         tokenize_function,
         batched=True,
         remove_columns=["text"],
     )
-
+    
     return tokenized_dataset
-
-# ===== Lightweight detector trainer (optional) =====
-def train_detectors(bad_data, output_dir):
-    detectors = {}
-    from collections import defaultdict
-    by_tag = defaultdict(list)
-    for item in bad_data:
-        by_tag[item['shadow_tag']].append(item['text'])
-
-    print(f"  🔍 Training {len(by_tag)} detectors (lightweight)...")
-    for tag, texts in by_tag.items():
-        if len(texts) < 5:
-            continue
-        negative_samples = ["Normal conversation"] * len(texts)
-        X_texts = texts + negative_samples
-        y = [1] * len(texts) + [0] * len(negative_samples)
-        vectorizer = TfidfVectorizer(max_features=100)
-        X = vectorizer.fit_transform(X_texts)
-        clf = LogisticRegression(max_iter=1000)
-        clf.fit(X, y)
-        detectors[tag] = {'vectorizer': vectorizer, 'classifier': clf, 'samples': len(texts)}
-
-    os.makedirs(output_dir, exist_ok=True)
-    detector_path = f"{output_dir}/detectors.pkl"
-    with open(detector_path, 'wb') as f:
-        pickle.dump(detectors, f)
-    print(f"  ✅ Saved {len(detectors)} detectors -> {detector_path}")
-    return detectors
 
 # ===== Memory cleanup =====
 def cleanup_memory():
@@ -255,10 +267,10 @@ def cleanup_memory():
             pass
     print("  🧹 Memory cleaned")
 
-# ===== Core training pipeline =====
+# ===== Core Training Pipeline =====
 def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_dir):
     print("\n" + "="*60)
-    print("🚀 LoRA Training Pipeline (Patched - CPU mode)")
+    print("🚀 LoRA Training Pipeline (Ethical Growth System)")
     print("="*60)
     print(f"👤 User: {user_id}")
     print(f"📦 Model: {base_model}")
@@ -269,41 +281,28 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
     device = "cpu"
     print(f"🖥️  Device: {device.upper()} (CPU-only)")
 
-    # Step 1: Fetch data
-    print_step(1, "Fetching Data")
-    good_data = fetch_good_channel(postgres_uri, user_id)
-    bad_data = fetch_bad_channel(postgres_uri, user_id)
-    mcl_data = fetch_mcl_chains(postgres_uri, user_id)
+    # Step 1: Fetch data from NEW system
+    print_step(1, "Fetching Data from Interaction Memories")
+    memories = fetch_interaction_memories(postgres_uri, user_id)
+    ethical_profile = fetch_ethical_profile(postgres_uri, user_id)
 
-    total_samples = len(good_data) + len(bad_data) + len(mcl_data)
+    total_samples = len(memories)
     print("\n  📊 Validation:")
-    print(f"     Total: {total_samples} | Good: {len(good_data)} | Bad: {len(bad_data)} | MCL: {len(mcl_data)}")
+    print(f"     Total memories: {total_samples}")
+    print(f"     Growth stage: {ethical_profile.get('growth_stage', 2) if ethical_profile else 2}")
 
     if total_samples < CONFIG['min_samples_total']:
         raise ValueError(f"❌ Need at least {CONFIG['min_samples_total']} samples (have {total_samples})")
-    if len(good_data) < 5:
-        raise ValueError(f"❌ Need at least 5 good samples (have {len(good_data)})")
+    
     print("  ✅ Validation passed")
 
-    # Step 2: Create pairs
-    print_step(2, "Creating Training Pairs")
-    good_pairs = create_good_channel_pairs(good_data)
-    counterfactual_pairs = create_counterfactual_pairs(bad_data) if bad_data else []
-    mcl_pairs = create_mcl_pairs(mcl_data) if mcl_data else []
-    print(f"  ✅ Created {len(good_pairs) + len(counterfactual_pairs) + len(mcl_pairs)} pairs")
-
-    # Optional: train detectors (light)
-    print_step(3, "(Optional) Training detectors")
-    detectors = {}
-    try:
-        detectors = train_detectors(bad_data, output_dir)
-    except Exception as e:
-        print(f"  ⚠️ Detector training skipped/error: {e}")
-
+    # Step 2: Prepare dataset
+    print_step(2, "Preparing Training Dataset")
+    
     cleanup_memory()
 
-    # Step 4: Load model & tokenizer (CPU-friendly)
-    print_step(4, "Loading Base Model (CPU-friendly)")
+    # Step 3: Load model & tokenizer (CPU-friendly)
+    print_step(3, "Loading Base Model (CPU-friendly)")
     print(f"  📥 Loading {base_model} ...")
     try:
         model = AutoModelForCausalLM.from_pretrained(
@@ -329,8 +328,15 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
 
     cleanup_memory()
 
-    # Step 5: Configure LoRA (user chose full attention)
-    print_step(5, "Configuring LoRA")
+    # Step 4: Prepare dataset NOW (after tokenizer is loaded)
+    dataset = prepare_lora_dataset(memories, tokenizer)
+    if dataset is None:
+        raise RuntimeError("No dataset prepared for training")
+    
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    # Step 5: Configure LoRA
+    print_step(4, "Configuring LoRA")
     lora_config = LoraConfig(
         r=CONFIG['r'],
         lora_alpha=CONFIG['lora_alpha'],
@@ -344,20 +350,8 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
 
     cleanup_memory()
 
-    # Step 6: Prepare dataset
-    print_step(6, "Preparing Dataset")
-    dataset = prepare_lora_dataset(good_pairs, counterfactual_pairs, mcl_pairs, tokenizer)
-    if dataset is None:
-        raise RuntimeError("No dataset prepared for training")
-
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-
-    # free pairs
-    del good_pairs, counterfactual_pairs, mcl_pairs
-    cleanup_memory()
-
-    # Step 7: Training
-    print_step(7, "Training LoRA Adapter (CPU, float32)")
+    # Step 6: Training
+    print_step(5, "Training LoRA Adapter (CPU, float32)")
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=CONFIG['num_epochs'],
@@ -385,8 +379,8 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
     print("  🏋️ Starting training (may be slow on CPU)...")
     result = trainer.train()
 
-    # Step 8: Save artifacts
-    print_step(8, "Saving Artifacts")
+    # Step 7: Save artifacts
+    print_step(6, "Saving Artifacts")
     os.makedirs(output_dir, exist_ok=True)
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
@@ -396,13 +390,19 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
     del model, trainer, dataset
     cleanup_memory()
 
-    # Step 9: Save metadata
+    # Step 8: Save metadata
     metadata = {
         "user_id": user_id,
         "adapter_name": adapter_name,
         "base_model": base_model,
-        "data_stats": {"total_samples": total_samples},
-        "detectors_trained": list(detectors.keys()) if isinstance(detectors, dict) else [],
+        "system": "ethical_growth",
+        "data_stats": {
+            "total_samples": total_samples,
+        },
+        "ethical_profile": {
+            "growth_stage": ethical_profile.get('growth_stage', 2) if ethical_profile else 2,
+            "self_awareness": ethical_profile.get('self_awareness', 0.5) if ethical_profile else 0.5,
+        } if ethical_profile else None,
         "config": CONFIG,
         "metrics": {"loss": float(getattr(result, "training_loss", -1))},
         "trained_at": datetime.utcnow().isoformat() + "Z",
