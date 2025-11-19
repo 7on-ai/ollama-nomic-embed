@@ -149,7 +149,8 @@ def create_training_pairs(memories):
             pairs.append({
                 'instruction': 'Respond as helpful personal assistant supporting growth',
                 'input': text,
-                'output': text
+                'output': text,
+                'weight': 1.5
             })
         
         elif classification == 'challenge_memory':
@@ -158,7 +159,8 @@ def create_training_pairs(memories):
             pairs.append({
                 'instruction': 'Respond with compassion to a challenge',
                 'input': text,
-                'output': output
+                'output': output,
+                'weight': 2.0
             })
         
         elif classification == 'wisdom_moment':
@@ -168,15 +170,26 @@ def create_training_pairs(memories):
             pairs.append({
                 'instruction': 'Share wisdom and insight',
                 'input': text,
-                'output': output
+                'output': output,
+                'weight': 2.5
+            })
+        
+        elif classification == 'neutral_interaction':
+            # ✅ NEW: Include neutral for general conversation
+            pairs.append({
+                'instruction': 'Respond naturally to everyday conversation',
+                'input': text,
+                'output': text,
+                'weight': 0.8
             })
         
         elif classification == 'needs_support':
-            # Crisis support (should rarely be approved, but handle gracefully)
+            # Crisis support (rarely approved, but handle gracefully)
             pairs.append({
-                'instruction': 'Provide supportive response',
+                'instruction': 'Provide supportive response with care',
                 'input': text,
-                'output': item.get('gentle_guidance') or "I care about you. Please reach out for support."
+                'output': item.get('gentle_guidance') or "I care about you. Please reach out for support.",
+                'weight': 1.0
             })
     
     return pairs
@@ -186,11 +199,12 @@ def prepare_lora_dataset(memories, tokenizer):
     if not memories:
         return None
     
-    # Group by classification
+    # Group by classification (5 types)
     by_class = {
         'growth_memory': [],
         'challenge_memory': [],
         'wisdom_moment': [],
+        'neutral_interaction': [],  # ✅ NEW
         'needs_support': []
     }
     
@@ -199,33 +213,38 @@ def prepare_lora_dataset(memories, tokenizer):
         if cls in by_class:
             by_class[cls].append(mem)
     
-    # Calculate sampling
+    # Calculate sampling based on weights
     total = len(memories)
-    growth_count = len(by_class['growth_memory']) + len(by_class['wisdom_moment'])
-    challenge_count = len(by_class['challenge_memory'])
-    wisdom_extra = len(by_class['wisdom_moment'])
     
-    # Sample with weights
     growth_samples = int(total * CONFIG['growth_weight'])
     challenge_samples = int(total * CONFIG['challenge_weight'])
     wisdom_samples = int(total * CONFIG['wisdom_weight'])
+    neutral_samples = int(total * CONFIG['neutral_weight'])  # ✅ NEW
+    support_samples = int(total * CONFIG['support_weight'])
     
     sampled = []
     
-    # Sample growth + wisdom
-    growth_pool = by_class['growth_memory'] + by_class['wisdom_moment']
-    if growth_pool:
-        sampled.extend(random.sample(growth_pool, min(growth_samples, len(growth_pool))))
+    # Sample each category
+    if by_class['growth_memory']:
+        sampled.extend(random.sample(by_class['growth_memory'], 
+                                     min(growth_samples, len(by_class['growth_memory']))))
     
-    # Sample challenges
     if by_class['challenge_memory']:
         sampled.extend(random.sample(by_class['challenge_memory'], 
                                      min(challenge_samples, len(by_class['challenge_memory']))))
     
-    # Sample extra wisdom (for depth)
     if by_class['wisdom_moment']:
         sampled.extend(random.sample(by_class['wisdom_moment'], 
                                      min(wisdom_samples, len(by_class['wisdom_moment']))))
+    
+    # ✅ NEW: Sample neutral interactions
+    if by_class['neutral_interaction']:
+        sampled.extend(random.sample(by_class['neutral_interaction'], 
+                                     min(neutral_samples, len(by_class['neutral_interaction']))))
+    
+    if by_class['needs_support']:
+        sampled.extend(random.sample(by_class['needs_support'], 
+                                     min(support_samples, len(by_class['needs_support']))))
     
     # Create pairs
     all_pairs = create_training_pairs(sampled)
@@ -233,6 +252,7 @@ def prepare_lora_dataset(memories, tokenizer):
     
     print(f"  📊 Dataset composition:")
     print(f"     Growth: {len(by_class['growth_memory'])} | Challenge: {len(by_class['challenge_memory'])} | Wisdom: {len(by_class['wisdom_moment'])}")
+    print(f"     Neutral: {len(by_class['neutral_interaction'])} | Support: {len(by_class['needs_support'])}")  # ✅ NEW
     print(f"     Total pairs: {len(all_pairs)}")
     
     # Tokenize
