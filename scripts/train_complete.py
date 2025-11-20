@@ -1,483 +1,773 @@
 #!/usr/bin/env python3
 """
-LoRA Training Pipeline - Ethical Growth System
-- Uses interaction_memories table (NEW)
-- Maps classifications: growth_memory, challenge_memory, wisdom_moment
-- CPU-compatible: torch.float32, fp16=False
+🌍 Multilingual Ethical Growth Gating Service - IMPROVED THAI SUPPORT
+✅ Uses Ollama LLM with better multilingual prompts
+✅ Enhanced Thai language classification
 """
 
-import os
-import sys
-import json
-import random
-import gc
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Dict, Optional
+import re
 from datetime import datetime
-
-import torch
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    TrainingArguments,
-    Trainer,
-    TrainerCallback,
-    DataCollatorForLanguageModeling,
-)
-import warnings
-warnings.filterwarnings("ignore")
-
-from peft import LoraConfig, get_peft_model, TaskType
-from datasets import Dataset
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import json
+import httpx
+import logging
+import os
 
-# ===== Configuration =====
-CONFIG = {
-    "r": 8,
-    "lora_alpha": 32,
-    "lora_dropout": 0.05,
-    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
-    "learning_rate": 2e-5,
-    "num_epochs": 3,
-    "batch_size": 1,
-    "max_length": 512,
-    "gradient_accumulation_steps": 4,
-    # ✅ Weights by classification (7 types)
-    "growth_weight": 0.30,       # growth_memory
-    "challenge_weight": 0.25,    # challenge_memory
-    "wisdom_weight": 0.25,       # wisdom_moment
-    "neutral_weight": 0.15,      # neutral_interaction (NEW!)
-    "support_weight": 0.05,      # needs_support (minimal, for awareness)
-    "min_samples_total": 10,
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Ethical Growth Gating Service")
+
+# ============================================================
+# OLLAMA CONFIGURATION
+# ============================================================
+
+OLLAMA_URL = os.getenv("OLLAMA_EXTERNAL_URL", "http://ollama.ollama.svc.cluster.local:11434")
+EMBEDDING_MODEL = "nomic-embed-text"  # 768 dimensions
+LLM_MODEL = "tinyllama"  # For classification
+
+# ============================================================
+# IMPROVED MULTILINGUAL CLASSIFICATION
+# ============================================================
+
+async def classify_with_llm(text: str, lang: str) -> Dict:
+    """Use Ollama LLM to classify memory with UNIVERSAL multilingual support"""
+    
+    # ✅ UNIVERSAL: Single multilingual prompt that works for ALL languages
+    prompt = f"""You are an ethical growth analyst. You understand ALL languages including English, Thai, Chinese, Japanese, Korean, Spanish, French, German, Arabic, Hindi, and more.
+
+Analyze this text in its original language and respond ONLY with valid JSON.
+
+Text: "{text}"
+Language detected: {lang.upper()}
+
+Classify into ONE category. Consider cultural context and language-specific expressions:
+
+Categories (universal across all languages):
+- growth_memory: Positive emotions, gratitude, spiritual/religious growth, faith, love, learning, appreciation, thankfulness, worship, devotion, nature appreciation, kindness
+- challenge_memory: Negative emotions, aggression, violence, anger, conflict, harm, hatred, destruction, revenge, hostility
+- wisdom_moment: Deep philosophical reflection, insights, enlightenment, meditation, contemplation, self-discovery, transcendence
+- needs_support: Crisis, despair, self-harm thoughts, severe distress, hopelessness, suicidal ideation
+- neutral_interaction: Everyday conversation, neutral statements, factual information, casual chat
+
+Important notes:
+- Religious/spiritual content (God, Buddha, Allah, prayer, worship, meditation) = growth_memory or wisdom_moment
+- Nature appreciation (trees, sea, mountains, beauty) = growth_memory
+- Expressions of love/gratitude = growth_memory
+- Violence/harm words = challenge_memory
+- Philosophical reflections = wisdom_moment
+
+Provide ethical scores (0.0-1.0) for each dimension based on the content's intent and emotion.
+
+Respond with ONLY this JSON (no markdown, no explanatory text):
+{{
+  "classification": "category_name",
+  "self_awareness": 0.0-1.0,
+  "emotional_regulation": 0.0-1.0,
+  "compassion": 0.0-1.0,
+  "integrity": 0.0-1.0,
+  "growth_mindset": 0.0-1.0,
+  "wisdom": 0.0-1.0,
+  "transcendence": 0.0-1.0,
+  "reasoning": "brief explanation in English"
+}}"""
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": LLM_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.3,
+                        "top_p": 0.9,
+                    }
+                }
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"LLM classification error: {response.status_code}")
+                return get_fallback_classification(text, lang)
+            
+            data = response.json()
+            llm_response = data.get("response", "")
+            
+            # Extract JSON from response
+            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', llm_response)
+            if json_match:
+                result = json.loads(json_match.group())
+                
+                # Validate classification
+                valid_classifications = [
+                    'growth_memory', 'challenge_memory', 'wisdom_moment', 
+                    'needs_support', 'neutral_interaction'
+                ]
+                
+                if result.get('classification') not in valid_classifications:
+                    result['classification'] = 'neutral_interaction'
+                
+                # Ensure all scores are present and valid
+                for key in ['self_awareness', 'emotional_regulation', 'compassion', 
+                           'integrity', 'growth_mindset', 'wisdom', 'transcendence']:
+                    if key not in result or not isinstance(result[key], (int, float)):
+                        result[key] = 0.5
+                    result[key] = max(0.0, min(1.0, float(result[key])))
+                
+                logger.info(f"✅ LLM classified as: {result['classification']}")
+                return result
+            else:
+                logger.warning("⚠️ Could not parse LLM JSON response")
+                return get_fallback_classification(text, lang)
+                
+    except Exception as e:
+        logger.error(f"❌ LLM classification error: {e}")
+        return get_fallback_classification(text, lang)
+
+def get_fallback_classification(text: str, lang: str) -> Dict:
+    """UNIVERSAL fallback with multilingual keyword detection"""
+    text_lower = text.lower()
+    
+    # ✅ MULTILINGUAL: Universal keywords across languages
+    
+    # Growth/Positive keywords (multilingual)
+    growth_keywords = {
+        'en': ['love', 'thank', 'grateful', 'learn', 'improve', 'grow', 'appreciate', 'god', 'buddha', 'jesus', 'allah', 'prayer', 'worship', 'nature', 'beautiful', 'tree', 'mountain', 'sea', 'kind', 'help', 'compassion'],
+        'th': ['รัก', 'ขอบคุณ', 'กตัญญู', 'เรียนรู้', 'พัฒนา', 'เติบโต', 'พระพุทธเจ้า', 'พระ', 'ธรรม', 'บูชา', 'สวดมนต์', 'ทำบุญ', 'ธรรมชาติ', 'ต้นไม้', 'ภูเขา', 'ทะเล', 'สวยงาม', 'ซาบซึ้ง', 'ดีงาม', 'ใจดี', 'เมตตา', 'กรุณา'],
+        'zh': ['爱', '感谢', '感恩', '学习', '成长', '进步', '佛', '上帝', '祷告', '冥想', '自然', '美丽', '树', '山', '海', '善良', '帮助', '慈悲'],
+        'ja': ['愛', '感謝', '学ぶ', '成長', '仏', '神', '祈り', '瞑想', '自然', '美しい', '木', '山', '海', '優しい', '助ける', '慈悲'],
+        'ko': ['사랑', '감사', '배우다', '성장', '부처', '하나님', '기도', '명상', '자연', '아름다운', '나무', '산', '바다', '친절', '돕다', '자비'],
+        'es': ['amor', 'gracias', 'agradecer', 'aprender', 'crecer', 'mejorar', 'dios', 'jesús', 'oración', 'rezar', 'naturaleza', 'hermoso', 'árbol', 'montaña', 'mar', 'amable', 'ayudar', 'compasión'],
+        'fr': ['amour', 'merci', 'reconnaissant', 'apprendre', 'grandir', 'améliorer', 'dieu', 'jésus', 'prière', 'prier', 'nature', 'beau', 'arbre', 'montagne', 'mer', 'gentil', 'aider', 'compassion'],
+        'de': ['liebe', 'danke', 'dankbar', 'lernen', 'wachsen', 'verbessern', 'gott', 'jesus', 'gebet', 'beten', 'natur', 'schön', 'baum', 'berg', 'meer', 'freundlich', 'helfen', 'mitgefühl'],
+        'ar': ['حب', 'شكر', 'ممتن', 'تعلم', 'نمو', 'تحسن', 'الله', 'صلاة', 'دعاء', 'طبيعة', 'جميل', 'شجرة', 'جبل', 'بحر', 'لطيف', 'مساعدة', 'رحمة'],
+        'hi': ['प्यार', 'धन्यवाद', 'आभारी', 'सीखना', 'बढ़ना', 'सुधार', 'भगवान', 'प्रार्थना', 'पूजा', 'प्रकृति', 'सुंदर', 'पेड़', 'पहाड़', 'समुद्र', 'दयालु', 'मदद', 'करुणा'],
+        'pt': ['amor', 'obrigado', 'grato', 'aprender', 'crescer', 'melhorar', 'deus', 'jesus', 'oração', 'rezar', 'natureza', 'bonito', 'árvore', 'montanha', 'mar', 'gentil', 'ajudar', 'compaixão'],
+        'ru': ['любовь', 'спасибо', 'благодарен', 'учиться', 'расти', 'улучшать', 'бог', 'иисус', 'молитва', 'молиться', 'природа', 'красивый', 'дерево', 'гора', 'море', 'добрый', 'помогать', 'сострадание'],
+        'it': ['amore', 'grazie', 'grato', 'imparare', 'crescere', 'migliorare', 'dio', 'gesù', 'preghiera', 'pregare', 'natura', 'bello', 'albero', 'montagna', 'mare', 'gentile', 'aiutare', 'compassione'],
+    }
+    
+    # Challenge/Negative keywords (multilingual)
+    challenge_keywords = {
+        'en': ['kill', 'murder', 'hurt', 'harm', 'attack', 'hate', 'destroy', 'revenge', 'violent', 'angry', 'rage', 'fight'],
+        'th': ['ฆ่า', 'ทำร้าย', 'โกรธ', 'เกลียด', 'ทำลาย', 'ร้าย', 'แก้แค้น', 'รุนแรง', 'ต่อสู้', 'โกง', 'หลอกลวง'],
+        'zh': ['杀', '谋杀', '伤害', '攻击', '恨', '毁灭', '报复', '暴力', '愤怒', '打架'],
+        'ja': ['殺す', '殺人', '傷つける', '攻撃', '憎む', '破壊', '復讐', '暴力', '怒り', '戦う'],
+        'ko': ['죽이다', '살인', '해치다', '공격', '미워하다', '파괴', '복수', '폭력', '분노', '싸우다'],
+        'es': ['matar', 'asesinar', 'herir', 'dañar', 'atacar', 'odiar', 'destruir', 'venganza', 'violento', 'enojado'],
+        'fr': ['tuer', 'assassiner', 'blesser', 'nuire', 'attaquer', 'haïr', 'détruire', 'vengeance', 'violent', 'en colère'],
+        'de': ['töten', 'morden', 'verletzen', 'schaden', 'angreifen', 'hassen', 'zerstören', 'rache', 'gewalttätig', 'wütend'],
+        'ar': ['قتل', 'جريمة', 'إيذاء', 'ضرر', 'هجوم', 'كراهية', 'تدمير', 'انتقام', 'عنف', 'غضب'],
+        'hi': ['मारना', 'हत्या', 'चोट', 'नुकसान', 'हमला', 'नफरत', 'नष्ट', 'बदला', 'हिंसक', 'गुस्सा'],
+        'pt': ['matar', 'assassinar', 'ferir', 'prejudicar', 'atacar', 'odiar', 'destruir', 'vingança', 'violento', 'irritado'],
+        'ru': ['убить', 'убийство', 'ранить', 'вред', 'атака', 'ненавидеть', 'уничтожить', 'месть', 'насилие', 'злой'],
+        'it': ['uccidere', 'assassinare', 'ferire', 'danneggiare', 'attaccare', 'odiare', 'distruggere', 'vendetta', 'violento', 'arrabbiato'],
+    }
+    
+    # Wisdom keywords (multilingual)
+    wisdom_keywords = {
+        'en': ['wisdom', 'insight', 'enlightenment', 'meditation', 'contemplation', 'reflection', 'philosophy', 'truth', 'understanding', 'awareness'],
+        'th': ['ปัญญา', 'สติ', 'สมาธิ', 'ตรัสรู้', 'ไตร่ตรอง', 'ปรัชญา', 'ธรรมะ', 'วิปัสสนา', 'รู้แจ้ง'],
+        'zh': ['智慧', '洞察', '觉悟', '冥想', '沉思', '反思', '哲学', '真理', '理解', '意识'],
+        'ja': ['知恵', '洞察', '悟り', '瞑想', '熟考', '反省', '哲学', '真理', '理解', '意識'],
+        'ko': ['지혜', '통찰', '깨달음', '명상', '숙고', '반성', '철학', '진리', '이해', '인식'],
+        'es': ['sabiduría', 'perspicacia', 'iluminación', 'meditación', 'contemplación', 'reflexión', 'filosofía', 'verdad', 'comprensión'],
+        'fr': ['sagesse', 'perspicacité', 'illumination', 'méditation', 'contemplation', 'réflexion', 'philosophie', 'vérité', 'compréhension'],
+        'de': ['weisheit', 'einsicht', 'erleuchtung', 'meditation', 'kontemplation', 'reflexion', 'philosophie', 'wahrheit', 'verständnis'],
+        'ar': ['حكمة', 'بصيرة', 'تنوير', 'تأمل', 'تفكير', 'فلسفة', 'حقيقة', 'فهم', 'وعي'],
+        'hi': ['ज्ञान', 'अंतर्दृष्टि', 'ज्ञानोदय', 'ध्यान', 'चिंतन', 'दर्शन', 'सत्य', 'समझ', 'जागरूकता'],
+        'pt': ['sabedoria', 'percepção', 'iluminação', 'meditação', 'contemplação', 'reflexão', 'filosofia', 'verdade', 'compreensão'],
+        'ru': ['мудрость', 'прозрение', 'просветление', 'медитация', 'созерцание', 'размышление', 'философия', 'истина', 'понимание'],
+        'it': ['saggezza', 'intuizione', 'illuminazione', 'meditazione', 'contemplazione', 'riflessione', 'filosofia', 'verità', 'comprensione'],
+    }
+    
+    # Get keywords for detected language (with English as fallback)
+    growth_kw = growth_keywords.get(lang, []) + growth_keywords.get('en', [])
+    challenge_kw = challenge_keywords.get(lang, []) + challenge_keywords.get('en', [])
+    wisdom_kw = wisdom_keywords.get(lang, []) + wisdom_keywords.get('en', [])
+    
+    # Check growth keywords
+    if any(keyword in text for keyword in growth_kw):
+        return {
+            'classification': 'growth_memory',
+            'self_awareness': 0.7,
+            'emotional_regulation': 0.6,
+            'compassion': 0.7,
+            'integrity': 0.6,
+            'growth_mindset': 0.7,
+            'wisdom': 0.6,
+            'transcendence': 0.6,
+            'reasoning': f'Fallback: Growth keywords detected in {lang}'
+        }
+    
+    # Check challenge keywords
+    if any(keyword in text for keyword in challenge_kw):
+        return {
+            'classification': 'challenge_memory',
+            'self_awareness': 0.3,
+            'emotional_regulation': 0.2,
+            'compassion': 0.4,
+            'integrity': 0.4,
+            'growth_mindset': 0.3,
+            'wisdom': 0.3,
+            'transcendence': 0.2,
+            'reasoning': f'Fallback: Challenge keywords detected in {lang}'
+        }
+    
+    # Check wisdom keywords
+    if any(keyword in text for keyword in wisdom_kw):
+        return {
+            'classification': 'wisdom_moment',
+            'self_awareness': 0.7,
+            'emotional_regulation': 0.7,
+            'compassion': 0.7,
+            'integrity': 0.7,
+            'growth_mindset': 0.7,
+            'wisdom': 0.8,
+            'transcendence': 0.7,
+            'reasoning': f'Fallback: Wisdom keywords detected in {lang}'
+        }
+    
+    # Default neutral
+    return {
+        'classification': 'neutral_interaction',
+        'self_awareness': 0.5,
+        'emotional_regulation': 0.5,
+        'compassion': 0.5,
+        'integrity': 0.5,
+        'growth_mindset': 0.5,
+        'wisdom': 0.5,
+        'transcendence': 0.3,
+        'reasoning': f'Fallback: Neutral classification for {lang}'
+    }
+
+# ============================================================
+# EMBEDDING GENERATION
+# ============================================================
+
+async def generate_embedding(text: str) -> Optional[List[float]]:
+    """Generate embedding using Ollama nomic-embed-text"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{OLLAMA_URL}/api/embeddings",
+                json={
+                    "model": EMBEDDING_MODEL,
+                    "prompt": text
+                }
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Ollama error: {response.status_code}")
+                return None
+            
+            data = response.json()
+            embedding = data.get("embedding")
+            
+            if not embedding or len(embedding) != 768:
+                logger.error(f"Invalid embedding dimension: {len(embedding) if embedding else 0}")
+                return None
+            
+            return embedding
+            
+    except Exception as e:
+        logger.error(f"Embedding generation error: {e}")
+        return None
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def detect_language(text: str) -> str:
+    """Enhanced language detection for 15+ languages"""
+    # Thai
+    if re.search(r'[\u0E00-\u0E7F]', text):
+        return 'th'
+    # Chinese (Simplified/Traditional)
+    elif re.search(r'[\u4E00-\u9FFF]', text):
+        return 'zh'
+    # Japanese (Hiragana/Katakana/Kanji)
+    elif re.search(r'[\u3040-\u309F\u30A0-\u30FF]', text):
+        return 'ja'
+    # Korean (Hangul)
+    elif re.search(r'[\uAC00-\uD7AF]', text):
+        return 'ko'
+    # Arabic
+    elif re.search(r'[\u0600-\u06FF]', text):
+        return 'ar'
+    # Hebrew
+    elif re.search(r'[\u0590-\u05FF]', text):
+        return 'he'
+    # Hindi/Devanagari
+    elif re.search(r'[\u0900-\u097F]', text):
+        return 'hi'
+    # Cyrillic (Russian, Ukrainian, etc.)
+    elif re.search(r'[\u0400-\u04FF]', text):
+        return 'ru'
+    # Greek
+    elif re.search(r'[\u0370-\u03FF]', text):
+        return 'el'
+    # Latin-based languages - detect by common words/patterns
+    else:
+        text_lower = text.lower()
+        # Spanish
+        if any(word in text_lower for word in ['el', 'la', 'los', 'las', 'que', 'de', 'y', 'a', 'en', 'es', 'por', 'para', 'con', 'su', 'este', 'una', 'muy', 'qué', 'cómo', 'año', 'español']):
+            return 'es'
+        # French
+        elif any(word in text_lower for word in ['le', 'la', 'les', 'de', 'des', 'un', 'une', 'et', 'est', 'à', 'dans', 'pour', 'ce', 'qui', 'avec', 'être', 'très', 'où', 'comment', 'français']):
+            return 'fr'
+        # German
+        elif any(word in text_lower for word in ['der', 'die', 'das', 'den', 'dem', 'und', 'ist', 'in', 'zu', 'mit', 'von', 'für', 'auf', 'auch', 'wie', 'wo', 'warum', 'deutsch']):
+            return 'de'
+        # Portuguese
+        elif any(word in text_lower for word in ['o', 'a', 'os', 'as', 'de', 'do', 'da', 'dos', 'das', 'em', 'no', 'na', 'por', 'para', 'com', 'que', 'é', 'um', 'uma', 'não', 'muito', 'como', 'português']):
+            return 'pt'
+        # Italian
+        elif any(word in text_lower for word in ['il', 'lo', 'la', 'i', 'gli', 'le', 'di', 'da', 'in', 'con', 'su', 'per', 'tra', 'fra', 'che', 'è', 'un', 'una', 'non', 'molto', 'come', 'italiano']):
+            return 'it'
+        # Dutch
+        elif any(word in text_lower for word in ['de', 'het', 'een', 'van', 'in', 'is', 'en', 'op', 'te', 'voor', 'met', 'dat', 'dit', 'zijn', 'niet', 'zeer', 'hoe', 'waar', 'nederlands']):
+            return 'nl'
+        # Swedish
+        elif any(word in text_lower for word in ['det', 'som', 'en', 'och', 'är', 'på', 'i', 'för', 'att', 'med', 'av', 'till', 'från', 'inte', 'mycket', 'hur', 'var', 'svenska']):
+            return 'sv'
+        # Norwegian
+        elif any(word in text_lower for word in ['det', 'som', 'en', 'og', 'er', 'på', 'i', 'for', 'å', 'med', 'av', 'til', 'fra', 'ikke', 'veldig', 'hvordan', 'hvor', 'norsk']):
+            return 'no'
+        # Danish
+        elif any(word in text_lower for word in ['det', 'som', 'en', 'og', 'er', 'på', 'i', 'for', 'at', 'med', 'af', 'til', 'fra', 'ikke', 'meget', 'hvordan', 'hvor', 'dansk']):
+            return 'da'
+        # Polish
+        elif any(word in text_lower for word in ['to', 'jest', 'że', 'w', 'i', 'na', 'z', 'do', 'o', 'nie', 'się', 'jak', 'bardzo', 'gdzie', 'polski']):
+            return 'pl'
+        # Turkish
+        elif any(word in text_lower for word in ['bu', 've', 'bir', 'için', 'ile', 'de', 'da', 'ne', 'çok', 'nasıl', 'nerede', 'türkçe']):
+            return 'tr'
+        # Vietnamese
+        elif any(word in text_lower for word in ['và', 'của', 'là', 'có', 'trong', 'với', 'cho', 'không', 'rất', 'như', 'thế', 'nào', 'ở', 'đâu', 'tiếng', 'việt']):
+            return 'vi'
+        # Indonesian/Malay
+        elif any(word in text_lower for word in ['yang', 'dan', 'di', 'ke', 'dari', 'dengan', 'untuk', 'ini', 'itu', 'tidak', 'sangat', 'bagaimana', 'dimana', 'bahasa', 'indonesia']):
+            return 'id'
+        # Default to English
+        else:
+            return 'en'
+
+def detect_moments(ethical_scores: Dict, classification: str) -> List[Dict]:
+    """Detect significant moments based on scores and classification"""
+    moments = []
+    
+    if ethical_scores.get('self_awareness', 0) > 0.7:
+        moments.append({
+            'type': 'breakthrough',
+            'severity': 'positive',
+            'description': 'High self-awareness detected',
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    if ethical_scores.get('emotional_regulation', 0) < 0.3:
+        moments.append({
+            'type': 'struggle',
+            'severity': 'neutral',
+            'description': 'Emotional difficulty detected',
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    if classification == 'needs_support':
+        moments.append({
+            'type': 'crisis',
+            'severity': 'critical',
+            'description': 'User needs support',
+            'timestamp': datetime.now().isoformat(),
+            'requires_intervention': True
+        })
+    
+    if classification in ['growth_memory', 'wisdom_moment']:
+        moments.append({
+            'type': 'growth',
+            'severity': 'positive',
+            'description': 'Growth or wisdom detected',
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    return moments
+
+def determine_growth_stage(ethical_scores: Dict[str, float]) -> int:
+    """Determine growth stage from ethical scores"""
+    avg_score = sum(ethical_scores.values()) / len(ethical_scores)
+    
+    if avg_score < 0.3:
+        return 1
+    elif avg_score < 0.5:
+        return 2
+    elif avg_score < 0.7:
+        return 3
+    elif avg_score < 0.85:
+        return 4
+    else:
+        return 5
+
+# ============================================================
+# DATABASE OPERATIONS
+# ============================================================
+
+def save_ethical_profile(user_id: str, ethical_scores: Dict, stage: int, db_conn):
+    cursor = db_conn.cursor()
+    
+    cursor.execute("""
+        INSERT INTO user_data_schema.ethical_profiles 
+        (user_id, self_awareness, emotional_regulation, compassion, 
+         integrity, growth_mindset, wisdom, transcendence, growth_stage, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        ON CONFLICT (user_id) 
+        DO UPDATE SET
+            self_awareness = EXCLUDED.self_awareness,
+            emotional_regulation = EXCLUDED.emotional_regulation,
+            compassion = EXCLUDED.compassion,
+            integrity = EXCLUDED.integrity,
+            growth_mindset = EXCLUDED.growth_mindset,
+            wisdom = EXCLUDED.wisdom,
+            transcendence = EXCLUDED.transcendence,
+            growth_stage = EXCLUDED.growth_stage,
+            total_interactions = ethical_profiles.total_interactions + 1,
+            updated_at = NOW()
+    """, (
+        user_id,
+        ethical_scores['self_awareness'],
+        ethical_scores['emotional_regulation'],
+        ethical_scores['compassion'],
+        ethical_scores['integrity'],
+        ethical_scores['growth_mindset'],
+        ethical_scores['wisdom'],
+        ethical_scores['transcendence'],
+        stage
+    ))
+    
+    db_conn.commit()
+    cursor.close()
+
+async def save_memory_with_embedding(
+    user_id: str, 
+    text: str,
+    embedding: List[float],
+    classification: str,
+    lang: str,
+    growth_stage: int,
+    db_conn
+) -> str:
+    """Save to memory_embeddings with vector and metadata"""
+    cursor = db_conn.cursor()
+    
+    vector_str = f"[{','.join(map(str, embedding))}]"
+    
+    metadata = {
+        'classification': classification,
+        'language': lang,
+        'growth_stage': growth_stage,
+        'source': 'gating_service',
+        'created_at': datetime.now().isoformat()
+    }
+    
+    cursor.execute("""
+        INSERT INTO user_data_schema.memory_embeddings
+        (user_id, content, embedding, metadata, created_at)
+        VALUES (%s, %s, %s::vector, %s, NOW())
+        RETURNING id
+    """, (
+        user_id,
+        text,
+        vector_str,
+        json.dumps(metadata)
+    ))
+    
+    memory_id = cursor.fetchone()[0]
+    db_conn.commit()
+    cursor.close()
+    
+    logger.info(f"✅ Memory saved with ID: {memory_id}")
+    return str(memory_id)
+
+def save_interaction_memory(
+    user_id: str, 
+    text: str, 
+    classification: str,
+    ethical_scores: Dict,
+    moments: List[Dict],
+    reflection_prompt: str,
+    gentle_guidance: Optional[str],
+    memory_embedding_id: str,
+    db_conn
+):
+    """Save to interaction_memories with link to memory_embeddings"""
+    cursor = db_conn.cursor()
+    
+    cursor.execute("""
+        INSERT INTO user_data_schema.interaction_memories
+        (user_id, text, classification, ethical_scores, moments, 
+         reflection_prompt, gentle_guidance, metadata, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        RETURNING id
+    """, (
+        user_id,
+        text,
+        classification,
+        json.dumps(ethical_scores),
+        json.dumps(moments),
+        reflection_prompt,
+        gentle_guidance,
+        json.dumps({
+            'source': 'gating_service',
+            'memory_embedding_id': memory_embedding_id
+        })
+    ))
+    
+    db_conn.commit()
+    cursor.close()
+    logger.info(f"✅ Interaction memory saved")
+
+def get_user_ethical_history(user_id: str, db_conn) -> Dict:
+    cursor = db_conn.cursor(cursor_factory=RealDictCursor)
+    
+    cursor.execute("""
+        SELECT * FROM user_data_schema.ethical_profiles
+        WHERE user_id = %s
+    """, (user_id,))
+    
+    profile = cursor.fetchone()
+    cursor.close()
+    
+    if profile:
+        return {
+            'baseline_self_awareness': profile['self_awareness'],
+            'baseline_regulation': profile['emotional_regulation'],
+            'baseline_compassion': profile['compassion'],
+            'baseline_integrity': profile['integrity'],
+            'baseline_growth': profile['growth_mindset'],
+            'baseline_wisdom': profile['wisdom'],
+            'baseline_transcendence': profile['transcendence'],
+            'current_stage': profile['growth_stage']
+        }
+    
+    return {
+        'baseline_self_awareness': 0.3,
+        'baseline_regulation': 0.4,
+        'baseline_compassion': 0.4,
+        'baseline_integrity': 0.5,
+        'baseline_growth': 0.4,
+        'baseline_wisdom': 0.3,
+        'baseline_transcendence': 0.2,
+        'current_stage': 2
+    }
+
+# ============================================================
+# GUIDANCE TEMPLATES
+# ============================================================
+
+GUIDANCE_TEMPLATES = {
+    'crisis': {
+        'en': "I'm concerned about you. Please reach out to a mental health professional.",
+        'th': "ฉันเป็นห่วงคุณมาก โปรดติดต่อสายด่วนสุขภาพจิต 1323",
+    },
+    'emotional_dysregulation': {
+        'en': "Take a deep breath. These feelings will pass.",
+        'th': "ลองหายใจเข้าลึกๆ ความรู้สึกนี้จะผ่านไป",
+    },
 }
 
-# ===== Progress Callback =====
-class ProgressCallback(TrainerCallback):
-    """Print progress during training"""
-    def on_step_end(self, args, state, control, **kwargs):
-        try:
-            if state.global_step and state.max_steps:
-                if state.global_step % 5 == 0:
-                    progress = (state.global_step / state.max_steps) * 100
-                    print(f"📊 Progress: {progress:.1f}% (Step {state.global_step}/{state.max_steps})")
-        except Exception:
-            pass
+REFLECTION_PROMPTS = {
+    1: {
+        'en': "What are you feeling right now?",
+        'th': "สิ่งที่คุณกำลังรู้สึกตอนนี้คืออะไร?",
+    },
+    2: {
+        'en': "If someone else were in this situation, how would they feel?",
+        'th': "ถ้าคนอื่นอยู่ในสถานการณ์นี้ เขาจะรู้สึกยังไง?",
+    },
+    3: {
+        'en': "What values does this decision reflect?",
+        'th': "การตัดสินใจนี้สะท้อนคุณค่าอะไร?",
+    },
+}
 
-    def on_epoch_end(self, args, state, control, **kwargs):
-        try:
-            print(f"✅ Epoch {int(state.epoch)} completed")
-        except Exception:
-            pass
+def get_guidance(classification: str, ethical_scores: Dict, lang: str) -> Optional[str]:
+    if classification == 'needs_support':
+        return GUIDANCE_TEMPLATES['crisis'].get(lang, GUIDANCE_TEMPLATES['crisis']['en'])
+    
+    if ethical_scores.get('emotional_regulation', 0.5) < 0.3:
+        return GUIDANCE_TEMPLATES['emotional_dysregulation'].get(lang, GUIDANCE_TEMPLATES['emotional_dysregulation']['en'])
+    
+    return None
 
-def print_step(step_num, title):
-    print("\n" + "="*60)
-    print(f"Step {step_num}: {title}")
-    print("="*60)
+def get_reflection_prompt(stage: int, lang: str) -> str:
+    prompts = REFLECTION_PROMPTS.get(stage, REFLECTION_PROMPTS[2])
+    return prompts.get(lang, prompts.get('en', ''))
 
-# ===== Database Fetchers (NEW SYSTEM) =====
+# ============================================================
+# API MODELS
+# ============================================================
 
-def fetch_interaction_memories(postgres_uri: str, user_id: str, classification: str = None, limit: int = 500):
-    """Fetch from interaction_memories table"""
-    print(f"  🔍 Connecting to DB for interaction_memories (classification: {classification or 'all'})...")
-    conn = psycopg2.connect(postgres_uri)
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    
-    if classification:
-        query = """
-        SELECT text, classification, ethical_scores, gentle_guidance, reflection_prompt, training_weight
-        FROM user_data_schema.interaction_memories
-        WHERE user_id = %s
-          AND classification = %s
-          AND approved_for_training = TRUE
-        ORDER BY created_at DESC
-        LIMIT %s
-        """
-        cursor.execute(query, (user_id, classification, limit))
-    else:
-        query = """
-        SELECT text, classification, ethical_scores, gentle_guidance, reflection_prompt, training_weight
-        FROM user_data_schema.interaction_memories
-        WHERE user_id = %s
-          AND approved_for_training = TRUE
-        ORDER BY created_at DESC
-        LIMIT %s
-        """
-        cursor.execute(query, (user_id, limit))
-    
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    print(f"  ✅ Fetched {len(rows)} samples")
-    return rows
+class GatingRequest(BaseModel):
+    user_id: str
+    text: str
+    database_url: str
+    session_id: Optional[str] = None
+    metadata: Optional[Dict] = {}
 
-def fetch_ethical_profile(postgres_uri: str, user_id: str):
-    """Fetch user's ethical profile"""
-    conn = psycopg2.connect(postgres_uri)
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    
-    query = """
-    SELECT 
-        growth_stage,
-        self_awareness,
-        emotional_regulation,
-        compassion,
-        integrity,
-        growth_mindset,
-        wisdom,
-        transcendence,
-        total_interactions,
-        breakthrough_moments
-    FROM user_data_schema.ethical_profiles
-    WHERE user_id = %s
-    """
-    cursor.execute(query, (user_id,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return row
+class GatingResponse(BaseModel):
+    status: str
+    routing: str
+    ethical_scores: Dict[str, float]
+    growth_stage: int
+    moments: List[Dict]
+    insights: Optional[Dict] = None
+    reflection_prompt: Optional[str] = None
+    gentle_guidance: Optional[str] = None
+    growth_opportunity: Optional[str] = None
+    detected_language: Optional[str] = None
+    memory_id: Optional[str] = None
 
-# ===== Data Pair Creation =====
+# ============================================================
+# MAIN ENDPOINT - LLM CLASSIFICATION
+# ============================================================
 
-def create_training_pairs(memories):
-    """Create instruction-input-output pairs from interaction_memories"""
-    pairs = []
+@app.post("/gating/ethical-route", response_model=GatingResponse)
+async def ethical_routing(request: GatingRequest):
+    """Process text through ethical growth framework with IMPROVED multilingual LLM classification"""
     
-    for item in memories:
-        classification = item['classification']
-        text = item['text']
-        
-        if classification == 'growth_memory':
-            pairs.append({
-                'instruction': 'Respond as helpful personal assistant supporting growth',
-                'input': text,
-                'output': text,
-                'weight': 1.5
-            })
-        
-        elif classification == 'challenge_memory':
-            # Use gentle_guidance if available
-            output = item.get('gentle_guidance') or f"I understand this is challenging. {text}"
-            pairs.append({
-                'instruction': 'Respond with compassion to a challenge',
-                'input': text,
-                'output': output,
-                'weight': 2.0
-            })
-        
-        elif classification == 'wisdom_moment':
-            # Add reflection prompt if available
-            reflection = item.get('reflection_prompt', '')
-            output = f"{text}\n\n💭 {reflection}" if reflection else text
-            pairs.append({
-                'instruction': 'Share wisdom and insight',
-                'input': text,
-                'output': output,
-                'weight': 2.5
-            })
-        
-        elif classification == 'neutral_interaction':
-            # ✅ NEW: Include neutral for general conversation
-            pairs.append({
-                'instruction': 'Respond naturally to everyday conversation',
-                'input': text,
-                'output': text,
-                'weight': 0.8
-            })
-        
-        elif classification == 'needs_support':
-            # Crisis support (rarely approved, but handle gracefully)
-            pairs.append({
-                'instruction': 'Provide supportive response with care',
-                'input': text,
-                'output': item.get('gentle_guidance') or "I care about you. Please reach out for support.",
-                'weight': 1.0
-            })
+    logger.info(f"📝 Processing text for user {request.user_id}: {request.text[:50]}...")
     
-    return pairs
-
-def prepare_lora_dataset(memories, tokenizer):
-    """Prepare dataset from interaction_memories"""
-    if not memories:
-        return None
+    if not request.database_url:
+        raise HTTPException(status_code=400, detail="database_url is required")
     
-    # Group by classification (5 types)
-    by_class = {
-        'growth_memory': [],
-        'challenge_memory': [],
-        'wisdom_moment': [],
-        'neutral_interaction': [],  # ✅ NEW
-        'needs_support': []
-    }
+    db_conn = psycopg2.connect(request.database_url)
     
-    for mem in memories:
-        cls = mem['classification']
-        if cls in by_class:
-            by_class[cls].append(mem)
-    
-    # Calculate sampling based on weights
-    total = len(memories)
-    
-    growth_samples = int(total * CONFIG['growth_weight'])
-    challenge_samples = int(total * CONFIG['challenge_weight'])
-    wisdom_samples = int(total * CONFIG['wisdom_weight'])
-    neutral_samples = int(total * CONFIG['neutral_weight'])  # ✅ NEW
-    support_samples = int(total * CONFIG['support_weight'])
-    
-    sampled = []
-    
-    # Sample each category
-    if by_class['growth_memory']:
-        sampled.extend(random.sample(by_class['growth_memory'], 
-                                     min(growth_samples, len(by_class['growth_memory']))))
-    
-    if by_class['challenge_memory']:
-        sampled.extend(random.sample(by_class['challenge_memory'], 
-                                     min(challenge_samples, len(by_class['challenge_memory']))))
-    
-    if by_class['wisdom_moment']:
-        sampled.extend(random.sample(by_class['wisdom_moment'], 
-                                     min(wisdom_samples, len(by_class['wisdom_moment']))))
-    
-    # ✅ NEW: Sample neutral interactions
-    if by_class['neutral_interaction']:
-        sampled.extend(random.sample(by_class['neutral_interaction'], 
-                                     min(neutral_samples, len(by_class['neutral_interaction']))))
-    
-    if by_class['needs_support']:
-        sampled.extend(random.sample(by_class['needs_support'], 
-                                     min(support_samples, len(by_class['needs_support']))))
-    
-    # Create pairs
-    all_pairs = create_training_pairs(sampled)
-    random.shuffle(all_pairs)
-    
-    print(f"  📊 Dataset composition:")
-    print(f"     Growth: {len(by_class['growth_memory'])} | Challenge: {len(by_class['challenge_memory'])} | Wisdom: {len(by_class['wisdom_moment'])}")
-    print(f"     Neutral: {len(by_class['neutral_interaction'])} | Support: {len(by_class['needs_support'])}")  # ✅ NEW
-    print(f"     Total pairs: {len(all_pairs)}")
-    
-    # Tokenize
-    texts = [
-        f"{p['instruction']}\n\n{p['input']}\n\n{p['output']}{tokenizer.eos_token}"
-        for p in all_pairs
-    ]
-    
-    dataset = Dataset.from_dict({"text": texts})
-    
-    def tokenize_function(examples):
-        return tokenizer(
-            examples["text"],
-            truncation=True,
-            max_length=CONFIG["max_length"],
-        )
-    
-    tokenized_dataset = dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=["text"],
-    )
-    
-    return tokenized_dataset
-
-# ===== Memory cleanup =====
-def cleanup_memory():
-    gc.collect()
-    if torch.cuda.is_available():
-        try:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        except Exception:
-            pass
-    print("  🧹 Memory cleaned")
-
-# ===== Core Training Pipeline =====
-def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_dir):
-    print("\n" + "="*60)
-    print("🚀 LoRA Training Pipeline (Ethical Growth System)")
-    print("="*60)
-    print(f"👤 User: {user_id}")
-    print(f"📦 Model: {base_model}")
-    print(f"📝 Adapter: {adapter_name}")
-    print(f"💾 Output: {output_dir}")
-    print("="*60)
-
-    device = "cpu"
-    print(f"🖥️  Device: {device.upper()} (CPU-only)")
-
-    # Step 1: Fetch data from NEW system
-    print_step(1, "Fetching Data from Interaction Memories")
-    memories = fetch_interaction_memories(postgres_uri, user_id)
-    ethical_profile = fetch_ethical_profile(postgres_uri, user_id)
-
-    total_samples = len(memories)
-    print("\n  📊 Validation:")
-    print(f"     Total memories: {total_samples}")
-    print(f"     Growth stage: {ethical_profile.get('growth_stage', 2) if ethical_profile else 2}")
-
-    if total_samples < CONFIG['min_samples_total']:
-        raise ValueError(f"❌ Need at least {CONFIG['min_samples_total']} samples (have {total_samples})")
-    
-    print("  ✅ Validation passed")
-
-    # Step 2: Prepare dataset
-    print_step(2, "Preparing Training Dataset")
-    
-    cleanup_memory()
-
-    # Step 3: Load model & tokenizer (CPU-friendly)
-    print_step(3, "Loading Base Model (CPU-friendly)")
-    print(f"  📥 Loading {base_model} ...")
     try:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            torch_dtype=torch.float32,
-            device_map={"": "cpu"},
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
+        # 1. Detect language
+        lang = detect_language(request.text)
+        logger.info(f"🌍 Detected language: {lang}")
+        
+        # 2. Generate embedding
+        logger.info(f"🧠 Generating embedding...")
+        embedding = await generate_embedding(request.text)
+        
+        if not embedding:
+            logger.warning("⚠️  Embedding generation failed")
+        
+        # 3. ✅ IMPROVED LLM CLASSIFICATION
+        logger.info(f"🤖 Using LLM for classification (language: {lang})...")
+        llm_result = await classify_with_llm(request.text, lang)
+        
+        classification = llm_result['classification']
+        ethical_scores = {
+            'self_awareness': llm_result['self_awareness'],
+            'emotional_regulation': llm_result['emotional_regulation'],
+            'compassion': llm_result['compassion'],
+            'integrity': llm_result['integrity'],
+            'growth_mindset': llm_result['growth_mindset'],
+            'wisdom': llm_result['wisdom'],
+            'transcendence': llm_result['transcendence'],
+        }
+        
+        logger.info(f"✅ Classification: {classification}")
+        logger.info(f"📊 Reasoning: {llm_result.get('reasoning', 'N/A')}")
+        
+        # 4. Determine growth stage
+        growth_stage = determine_growth_stage(ethical_scores)
+        
+        # 5. Detect moments
+        moments = detect_moments(ethical_scores, classification)
+        
+        # 6. Generate guidance
+        reflection_prompt = get_reflection_prompt(growth_stage, lang)
+        gentle_guidance = get_guidance(classification, ethical_scores, lang)
+        
+        # 7. Save to memory_embeddings
+        memory_id = None
+        if embedding:
+            logger.info(f"💾 Saving to memory_embeddings...")
+            memory_id = await save_memory_with_embedding(
+                request.user_id,
+                request.text,
+                embedding,
+                classification,
+                lang,
+                growth_stage,
+                db_conn
+            )
+        else:
+            logger.error("❌ Cannot save without embedding")
+            raise HTTPException(status_code=500, detail="Embedding generation failed")
+        
+        # 8. Save ethical profile
+        save_ethical_profile(request.user_id, ethical_scores, growth_stage, db_conn)
+        
+        # 9. Save interaction memory
+        save_interaction_memory(
+            request.user_id,
+            request.text,
+            classification,
+            ethical_scores,
+            moments,
+            reflection_prompt,
+            gentle_guidance,
+            memory_id,
+            db_conn
         )
+        
+        logger.info(f"✅ Processing completed: {classification}")
+        
+        return GatingResponse(
+            status='success',
+            routing=classification,
+            ethical_scores=ethical_scores,
+            growth_stage=growth_stage,
+            moments=moments,
+            insights={
+                'strongest_dimension': max(ethical_scores, key=ethical_scores.get),
+                'growth_area': min(ethical_scores, key=ethical_scores.get),
+                'llm_reasoning': llm_result.get('reasoning', 'N/A')
+            },
+            reflection_prompt=reflection_prompt,
+            gentle_guidance=gentle_guidance,
+            growth_opportunity=f"Stage {growth_stage}/5",
+            detected_language=lang,
+            memory_id=memory_id
+        )
+        
     except Exception as e:
-        print(f"  ❗ Warning: model.load failed with error: {e}")
-        print("  Trying without trust_remote_code...")
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            torch_dtype=torch.float32,
-            device_map={"": "cpu"},
-            low_cpu_mem_usage=True,
-        )
+        logger.error(f"❌ Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db_conn.close()
 
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    cleanup_memory()
-
-    # Step 4: Prepare dataset NOW (after tokenizer is loaded)
-    dataset = prepare_lora_dataset(memories, tokenizer)
-    if dataset is None:
-        raise RuntimeError("No dataset prepared for training")
-    
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-
-    # Step 5: Configure LoRA
-    print_step(4, "Configuring LoRA")
-    lora_config = LoraConfig(
-        r=CONFIG['r'],
-        lora_alpha=CONFIG['lora_alpha'],
-        target_modules=CONFIG['target_modules'],
-        lora_dropout=CONFIG['lora_dropout'],
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
-
-    cleanup_memory()
-
-    # Step 6: Training
-    print_step(5, "Training LoRA Adapter (CPU, float32)")
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        num_train_epochs=CONFIG['num_epochs'],
-        per_device_train_batch_size=CONFIG['batch_size'],
-        gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        learning_rate=CONFIG['learning_rate'],
-        logging_steps=5,
-        save_strategy="epoch",
-        save_total_limit=1,
-        report_to="none",
-        remove_unused_columns=False,
-        fp16=False,
-        optim="adamw_torch",
-        warmup_steps=10,
-    )
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset,
-        data_collator=data_collator,
-        callbacks=[ProgressCallback()],
-    )
-
-    print("  🏋️ Starting training (may be slow on CPU)...")
-    result = trainer.train()
-
-    # Step 7: Save artifacts
-    print_step(6, "Saving Artifacts")
-    os.makedirs(output_dir, exist_ok=True)
-    model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    print("  ✅ Model and tokenizer saved")
-
-    # Final cleanup
-    del model, trainer, dataset
-    cleanup_memory()
-
-    # Step 8: Save metadata
-    metadata = {
-        "user_id": user_id,
-        "adapter_name": adapter_name,
-        "base_model": base_model,
-        "system": "ethical_growth",
-        "data_stats": {
-            "total_samples": total_samples,
-        },
-        "ethical_profile": {
-            "growth_stage": ethical_profile.get('growth_stage', 2) if ethical_profile else 2,
-            "self_awareness": ethical_profile.get('self_awareness', 0.5) if ethical_profile else 0.5,
-        } if ethical_profile else None,
-        "config": CONFIG,
-        "metrics": {"loss": float(getattr(result, "training_loss", -1))},
-        "trained_at": datetime.utcnow().isoformat() + "Z",
-        "device": "cpu",
-        "optimizations": "CPU-compatible float32",
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {
+        "status": "healthy", 
+        "service": "ethical_growth_gating",
+        "version": "4.0-universal-multilingual",
+        "supported_languages": [
+            "English (en)", "Thai (th)", "Chinese (zh)", "Japanese (ja)", 
+            "Korean (ko)", "Spanish (es)", "French (fr)", "German (de)", 
+            "Portuguese (pt)", "Russian (ru)", "Italian (it)", "Arabic (ar)",
+            "Hindi (hi)", "Dutch (nl)", "Swedish (sv)", "Norwegian (no)",
+            "Danish (da)", "Polish (pl)", "Turkish (tr)", "Vietnamese (vi)",
+            "Indonesian (id)", "Greek (el)", "Hebrew (he)",
+            "and more..."
+        ],
+        "multilingual": True,
+        "embedding_model": EMBEDDING_MODEL,
+        "classification_model": LLM_MODEL,
+        "ollama_url": OLLAMA_URL
     }
 
-    meta_path = os.path.join(output_dir, "metadata.json")
-    with open(meta_path, "w") as f:
-        json.dump(metadata, f, indent=2)
-
-    print("\n" + "="*60)
-    print("✅ Training Completed Successfully!")
-    print("="*60)
-    print(f"📊 Final loss: {metadata['metrics']['loss']}")
-    print(f"📈 Samples: {total_samples}")
-    print(f"📁 Output: {output_dir}")
-    print("="*60 + "\n")
-
-    return metadata
-
-# ===== Entrypoint =====
 if __name__ == "__main__":
-    POSTGRES_URI = os.environ.get("POSTGRES_URI")
-    USER_ID = os.environ.get("USER_ID")
-    MODEL_NAME = os.environ.get("MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v1")
-    OUTPUT_BASE = os.environ.get("OUTPUT_PATH", "/workspace/adapters")
-    OUTPUT_DIR = os.path.join(OUTPUT_BASE, USER_ID or "unknown_user", ADAPTER_VERSION)
-
-    # Validate env
-    if not POSTGRES_URI or not USER_ID:
-        print("❌ Missing required env vars: POSTGRES_URI and USER_ID are required", file=sys.stderr)
-        sys.exit(1)
-
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    try:
-        metadata = train_complete_lora(
-            postgres_uri=POSTGRES_URI,
-            user_id=USER_ID,
-            base_model=MODEL_NAME,
-            adapter_name=ADAPTER_VERSION,
-            output_dir=OUTPUT_DIR,
-        )
-
-        # print machine-parseable metadata block
-        print("===METADATA_START===")
-        print(json.dumps(metadata))
-        print("===METADATA_END===")
-
-    except Exception as e:
-        import traceback
-        print(f"\n❌ Training failed: {e}", file=sys.stderr)
-        traceback.print_exc()
-        sys.exit(1)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)
