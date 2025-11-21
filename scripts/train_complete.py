@@ -1,9 +1,10 @@
-    #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-LoRA Training Pipeline - Ethical Growth System
+LoRA Training Pipeline - Ethical Growth System with Volume Integration
 - Uses interaction_memories table (NEW)
 - Maps classifications: growth_memory, challenge_memory, wisdom_moment
 - CPU-compatible: torch.float32, fp16=False
+- ✅ NEW: Copies trained adapter to shared volume for Ollama
 """
 
 import os
@@ -11,7 +12,9 @@ import sys
 import json
 import random
 import gc
+import shutil
 from datetime import datetime
+from pathlib import Path
 
 import torch
 from transformers import (
@@ -41,12 +44,12 @@ CONFIG = {
     "batch_size": 1,
     "max_length": 512,
     "gradient_accumulation_steps": 4,
-    # ✅ Weights by classification (7 types)
-    "growth_weight": 0.30,       # growth_memory
-    "challenge_weight": 0.25,    # challenge_memory
-    "wisdom_weight": 0.25,       # wisdom_moment
-    "neutral_weight": 0.15,      # neutral_interaction (NEW!)
-    "support_weight": 0.05,      # needs_support (minimal, for awareness)
+    # Weights by classification (5 types)
+    "growth_weight": 0.30,
+    "challenge_weight": 0.25,
+    "wisdom_weight": 0.25,
+    "neutral_weight": 0.15,
+    "support_weight": 0.05,
     "min_samples_total": 10,
 }
 
@@ -73,7 +76,7 @@ def print_step(step_num, title):
     print(f"Step {step_num}: {title}")
     print("="*60)
 
-# ===== Database Fetchers (NEW SYSTEM) =====
+# ===== Database Fetchers =====
 
 def fetch_interaction_memories(postgres_uri: str, user_id: str, classification: str = None, limit: int = 500):
     """Fetch from interaction_memories table"""
@@ -154,7 +157,6 @@ def create_training_pairs(memories):
             })
         
         elif classification == 'challenge_memory':
-            # Use gentle_guidance if available
             output = item.get('gentle_guidance') or f"I understand this is challenging. {text}"
             pairs.append({
                 'instruction': 'Respond with compassion to a challenge',
@@ -164,7 +166,6 @@ def create_training_pairs(memories):
             })
         
         elif classification == 'wisdom_moment':
-            # Add reflection prompt if available
             reflection = item.get('reflection_prompt', '')
             output = f"{text}\n\n💭 {reflection}" if reflection else text
             pairs.append({
@@ -175,7 +176,6 @@ def create_training_pairs(memories):
             })
         
         elif classification == 'neutral_interaction':
-            # ✅ NEW: Include neutral for general conversation
             pairs.append({
                 'instruction': 'Respond naturally to everyday conversation',
                 'input': text,
@@ -184,7 +184,6 @@ def create_training_pairs(memories):
             })
         
         elif classification == 'needs_support':
-            # Crisis support (rarely approved, but handle gracefully)
             pairs.append({
                 'instruction': 'Provide supportive response with care',
                 'input': text,
@@ -199,12 +198,12 @@ def prepare_lora_dataset(memories, tokenizer):
     if not memories:
         return None
     
-    # Group by classification (5 types)
+    # Group by classification
     by_class = {
         'growth_memory': [],
         'challenge_memory': [],
         'wisdom_moment': [],
-        'neutral_interaction': [],  # ✅ NEW
+        'neutral_interaction': [],
         'needs_support': []
     }
     
@@ -219,7 +218,7 @@ def prepare_lora_dataset(memories, tokenizer):
     growth_samples = int(total * CONFIG['growth_weight'])
     challenge_samples = int(total * CONFIG['challenge_weight'])
     wisdom_samples = int(total * CONFIG['wisdom_weight'])
-    neutral_samples = int(total * CONFIG['neutral_weight'])  # ✅ NEW
+    neutral_samples = int(total * CONFIG['neutral_weight'])
     support_samples = int(total * CONFIG['support_weight'])
     
     sampled = []
@@ -237,7 +236,6 @@ def prepare_lora_dataset(memories, tokenizer):
         sampled.extend(random.sample(by_class['wisdom_moment'], 
                                      min(wisdom_samples, len(by_class['wisdom_moment']))))
     
-    # ✅ NEW: Sample neutral interactions
     if by_class['neutral_interaction']:
         sampled.extend(random.sample(by_class['neutral_interaction'], 
                                      min(neutral_samples, len(by_class['neutral_interaction']))))
@@ -252,7 +250,7 @@ def prepare_lora_dataset(memories, tokenizer):
     
     print(f"  📊 Dataset composition:")
     print(f"     Growth: {len(by_class['growth_memory'])} | Challenge: {len(by_class['challenge_memory'])} | Wisdom: {len(by_class['wisdom_moment'])}")
-    print(f"     Neutral: {len(by_class['neutral_interaction'])} | Support: {len(by_class['needs_support'])}")  # ✅ NEW
+    print(f"     Neutral: {len(by_class['neutral_interaction'])} | Support: {len(by_class['needs_support'])}")
     print(f"     Total pairs: {len(all_pairs)}")
     
     # Tokenize
@@ -289,7 +287,104 @@ def cleanup_memory():
             pass
     print("  🧹 Memory cleaned")
 
+# ===== ✅ NEW: Volume Integration =====
+
+def copy_to_volume(output_dir: str, volume_mount: str, user_id: str, adapter_version: str):
+    """
+    Copy trained adapter to shared volume for Ollama
+    
+    Args:
+        output_dir: Local output directory (/workspace/adapters/user_id/version)
+        volume_mount: Volume mount path (/models/adapters)
+        user_id: User ID
+        adapter_version: Version string (v1234567890)
+    
+    Returns:
+        bool: True if copy successful, False otherwise
+    """
+    try:
+        print_step(7, "Copying to Volume for Ollama")
+        
+        # Check if volume is mounted
+        if not os.path.exists(volume_mount):
+            print(f"⚠️  Volume not mounted at {volume_mount}")
+            print("   Files will remain in job storage only")
+            print("   To enable volume mount, add in Northflank Job config:")
+            print(f"   volumes:")
+            print(f"     - name: lora-adapters")
+            print(f"       mountPath: {volume_mount}")
+            return False
+        
+        # Create destination directory
+        dest_dir = os.path.join(volume_mount, user_id, adapter_version)
+        os.makedirs(dest_dir, exist_ok=True)
+        
+        print(f"  📂 Source: {output_dir}")
+        print(f"  📂 Destination: {dest_dir}")
+        
+        # List of essential files to copy
+        files_to_copy = [
+            'adapter_model.safetensors',
+            'adapter_config.json',
+            'tokenizer.json',
+            'tokenizer_config.json',
+            'special_tokens_map.json',
+            'README.md',
+            'metadata.json',
+        ]
+        
+        copied_count = 0
+        total_size = 0
+        
+        print("  📦 Copying files...")
+        for filename in files_to_copy:
+            src = os.path.join(output_dir, filename)
+            dst = os.path.join(dest_dir, filename)
+            
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+                file_size = os.path.getsize(dst)
+                total_size += file_size
+                copied_count += 1
+                print(f"    ✅ {filename} ({file_size / 1024 / 1024:.1f} MB)")
+            else:
+                print(f"    ⚠️  Missing: {filename}")
+        
+        print(f"\n  ✅ Copied {copied_count}/{len(files_to_copy)} files")
+        print(f"  📊 Total size: {total_size / 1024 / 1024:.1f} MB")
+        
+        # ✅ Create marker file for Ollama integration
+        marker_data = {
+            'user_id': user_id,
+            'adapter_version': adapter_version,
+            'copied_at': datetime.utcnow().isoformat() + 'Z',
+            'file_count': copied_count,
+            'total_size_bytes': total_size,
+            'ollama_model_name': f'sunday-ai-{user_id}',
+            'adapter_path': dest_dir,
+            'status': 'ready',
+        }
+        
+        marker_path = os.path.join(dest_dir, '.ready')
+        with open(marker_path, 'w') as f:
+            json.dump(marker_data, f, indent=2)
+        
+        print(f"  ✅ Created marker file: .ready")
+        print(f"\n  🎯 Ollama Integration:")
+        print(f"     Model name: sunday-ai-{user_id}")
+        print(f"     Adapter path: {dest_dir}")
+        print(f"     Status: READY")
+        
+        return True
+        
+    except Exception as e:
+        print(f"  ❌ Volume copy error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 # ===== Core Training Pipeline =====
+
 def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_dir):
     print("\n" + "="*60)
     print("🚀 LoRA Training Pipeline (Ethical Growth System)")
@@ -303,7 +398,7 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
     device = "cpu"
     print(f"🖥️  Device: {device.upper()} (CPU-only)")
 
-    # Step 1: Fetch data from NEW system
+    # Step 1: Fetch data
     print_step(1, "Fetching Data from Interaction Memories")
     memories = fetch_interaction_memories(postgres_uri, user_id)
     ethical_profile = fetch_ethical_profile(postgres_uri, user_id)
@@ -318,13 +413,10 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
     
     print("  ✅ Validation passed")
 
-    # Step 2: Prepare dataset
-    print_step(2, "Preparing Training Dataset")
-    
     cleanup_memory()
 
-    # Step 3: Load model & tokenizer (CPU-friendly)
-    print_step(3, "Loading Base Model (CPU-friendly)")
+    # Step 2: Load model & tokenizer
+    print_step(2, "Loading Base Model (CPU-friendly)")
     print(f"  📥 Loading {base_model} ...")
     try:
         model = AutoModelForCausalLM.from_pretrained(
@@ -350,14 +442,15 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
 
     cleanup_memory()
 
-    # Step 4: Prepare dataset NOW (after tokenizer is loaded)
+    # Step 3: Prepare dataset
+    print_step(3, "Preparing Training Dataset")
     dataset = prepare_lora_dataset(memories, tokenizer)
     if dataset is None:
         raise RuntimeError("No dataset prepared for training")
     
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-    # Step 5: Configure LoRA
+    # Step 4: Configure LoRA
     print_step(4, "Configuring LoRA")
     lora_config = LoraConfig(
         r=CONFIG['r'],
@@ -372,7 +465,7 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
 
     cleanup_memory()
 
-    # Step 6: Training
+    # Step 5: Training
     print_step(5, "Training LoRA Adapter (CPU, float32)")
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -398,21 +491,21 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
         callbacks=[ProgressCallback()],
     )
 
-    print("  🏋️ Starting training (may be slow on CPU)...")
+    print("  🏋️  Starting training (may be slow on CPU)...")
     result = trainer.train()
 
-    # Step 7: Save artifacts
+    # Step 6: Save artifacts
     print_step(6, "Saving Artifacts")
     os.makedirs(output_dir, exist_ok=True)
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     print("  ✅ Model and tokenizer saved")
 
-    # Final cleanup
+    # Cleanup before volume copy
     del model, trainer, dataset
     cleanup_memory()
 
-    # Step 8: Save metadata
+    # Step 7: Save metadata
     metadata = {
         "user_id": user_id,
         "adapter_name": adapter_name,
@@ -447,12 +540,15 @@ def train_complete_lora(postgres_uri, user_id, base_model, adapter_name, output_
     return metadata
 
 # ===== Entrypoint =====
+
 if __name__ == "__main__":
     POSTGRES_URI = os.environ.get("POSTGRES_URI")
     USER_ID = os.environ.get("USER_ID")
     MODEL_NAME = os.environ.get("MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v1")
     OUTPUT_BASE = os.environ.get("OUTPUT_PATH", "/workspace/adapters")
+    VOLUME_MOUNT = os.environ.get("VOLUME_MOUNT", "/models/adapters")
+    
     OUTPUT_DIR = os.path.join(OUTPUT_BASE, USER_ID or "unknown_user", ADAPTER_VERSION)
 
     # Validate env
@@ -463,6 +559,7 @@ if __name__ == "__main__":
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     try:
+        # Run training
         metadata = train_complete_lora(
             postgres_uri=POSTGRES_URI,
             user_id=USER_ID,
@@ -471,10 +568,35 @@ if __name__ == "__main__":
             output_dir=OUTPUT_DIR,
         )
 
-        # print machine-parseable metadata block
-        print("===METADATA_START===")
+        # ✅ NEW: Copy to volume
+        volume_success = copy_to_volume(
+            output_dir=OUTPUT_DIR,
+            volume_mount=VOLUME_MOUNT,
+            user_id=USER_ID,
+            adapter_version=ADAPTER_VERSION
+        )
+
+        # Add volume info to metadata
+        if volume_success:
+            metadata['volume_integration'] = {
+                'copied': True,
+                'volume_path': os.path.join(VOLUME_MOUNT, USER_ID, ADAPTER_VERSION),
+                'ollama_ready': True,
+            }
+            print("\n🎉 Adapter ready for Ollama inference!")
+        else:
+            metadata['volume_integration'] = {
+                'copied': False,
+                'note': 'Volume not mounted - files in job storage only',
+            }
+            print("\n⚠️  Volume not available - files saved to job storage")
+
+        # Print machine-parseable metadata
+        print("\n===METADATA_START===")
         print(json.dumps(metadata))
         print("===METADATA_END===")
+        
+        print(f"\n[{datetime.utcnow().isoformat()}Z INFO ] Process terminated with exit code 0")
 
     except Exception as e:
         import traceback
