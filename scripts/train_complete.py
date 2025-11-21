@@ -295,7 +295,7 @@ def copy_to_volume(output_dir: str, volume_mount: str, user_id: str, adapter_ver
     
     Args:
         output_dir: Local output directory (/workspace/adapters/user_id/version)
-        volume_mount: Volume mount path (/models/adapters)
+        volume_mount: Volume mount path (/workspace/adapters)
         user_id: User ID
         adapter_version: Version string (v1234567890)
     
@@ -547,7 +547,7 @@ if __name__ == "__main__":
     MODEL_NAME = os.environ.get("MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v1")
     OUTPUT_BASE = os.environ.get("OUTPUT_PATH", "/workspace/adapters")
-    VOLUME_MOUNT = os.environ.get("VOLUME_MOUNT", "/models/adapters")
+    VOLUME_MOUNT = os.environ.get("VOLUME_MOUNT", "/workspace/adapters")
     
     OUTPUT_DIR = os.path.join(OUTPUT_BASE, USER_ID or "unknown_user", ADAPTER_VERSION)
 
