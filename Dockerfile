@@ -37,10 +37,6 @@ COPY scripts/train_complete.py /workspace/scripts/train_complete.py
 COPY scripts/api_server.py /workspace/scripts/api_server.py
 RUN chmod +x /workspace/scripts/*.py
 
-# ✅ NEW: Copy entrypoint wrapper
-COPY scripts/entrypoint.sh /workspace/entrypoint.sh
-RUN chmod +x /workspace/entrypoint.sh
-
 # Environment
 ENV OUTPUT_PATH=/models/adapters
 ENV PYTHONUNBUFFERED=1
@@ -49,5 +45,5 @@ ENV API_PORT=8000
 # Expose API port
 EXPOSE 8000
 
-# ✅ Use entrypoint wrapper to ensure startup
-ENTRYPOINT ["/workspace/entrypoint.sh"]
+# ✅ Start API server directly (no wrapper needed)
+CMD ["python3", "-u", "/workspace/scripts/api_server.py"]
