@@ -17,7 +17,7 @@ WORKDIR /workspace
 RUN pip install --no-cache-dir \
     torch==2.2.0 \
     transformers==4.38.0 \
-    peft==4.8.0 \
+    peft==0.8.0 \
     accelerate==0.27.0 \
     bitsandbytes==0.42.0 \
     datasets==2.17.0 \
