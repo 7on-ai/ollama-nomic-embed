@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-LoRA Training Service API Server
-- Scale to 0 when idle
-- Trigger training via REST API
-- Store outputs in Volume
+LoRA Training Service API Server - FIXED VERSION
+- Better startup logging
+- Proper error handling
+- Health check that actually works
 """
 
 import os
@@ -14,11 +14,33 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import logging
+import traceback
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-import psycopg2
+# ===== CRITICAL: Configure logging FIRST =====
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Log startup immediately
+logger.info("="*60)
+logger.info("🚀 API Server Starting...")
+logger.info("="*60)
+
+try:
+    from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
+    from fastapi.responses import JSONResponse
+    from pydantic import BaseModel, Field
+    import psycopg2
+    logger.info("✅ Imports successful")
+except Exception as e:
+    logger.error(f"❌ Import failed: {e}")
+    logger.error(traceback.format_exc())
+    sys.exit(1)
 
 # ===== Configuration =====
 API_PORT = int(os.environ.get('API_PORT', 8000))
@@ -26,12 +48,11 @@ OUTPUT_PATH = os.environ.get('OUTPUT_PATH', '/models/adapters')
 POSTGRES_URI = os.environ.get('POSTGRES_URI', '')
 MODEL_NAME = os.environ.get('MODEL_NAME', 'TinyLlama/TinyLlama-1.1B-Chat-v1.0')
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logger.info(f"📊 Configuration:")
+logger.info(f"   API_PORT: {API_PORT}")
+logger.info(f"   OUTPUT_PATH: {OUTPUT_PATH}")
+logger.info(f"   MODEL_NAME: {MODEL_NAME}")
+logger.info(f"   POSTGRES_URI: {'[SET]' if POSTGRES_URI else '[NOT SET]'}")
 
 # ===== FastAPI App =====
 app = FastAPI(
@@ -57,7 +78,7 @@ class TrainingResponse(BaseModel):
 
 class StatusResponse(BaseModel):
     training_id: str
-    status: str  # pending, running, completed, failed
+    status: str
     adapter_version: Optional[str] = None
     output_path: Optional[str] = None
     error: Optional[str] = None
@@ -67,16 +88,13 @@ class StatusResponse(BaseModel):
 # ===== In-Memory Training Status =====
 training_status = {}
 
-# ===== Helper Functions =====
 def update_training_status(training_id: str, status: dict):
-    """Update training status in memory"""
     training_status[training_id] = {
         **status,
         'updated_at': datetime.utcnow().isoformat() + 'Z'
     }
 
 def get_training_status(training_id: str) -> Optional[dict]:
-    """Get training status"""
     return training_status.get(training_id)
 
 async def run_training_job(
@@ -90,7 +108,6 @@ async def run_training_job(
     try:
         logger.info(f"🚀 Starting training: {training_id}")
         
-        # Update status to running
         update_training_status(training_id, {
             'training_id': training_id,
             'status': 'running',
@@ -99,7 +116,6 @@ async def run_training_job(
             'created_at': datetime.utcnow().isoformat() + 'Z'
         })
         
-        # Prepare environment
         env = os.environ.copy()
         env.update({
             'POSTGRES_URI': postgres_uri,
@@ -112,7 +128,6 @@ async def run_training_job(
         
         output_dir = os.path.join(OUTPUT_PATH, user_id, adapter_version)
         
-        # Run training script
         logger.info(f"📝 Running training script...")
         process = subprocess.Popen(
             ['python3', '/workspace/scripts/train_complete.py'],
@@ -136,7 +151,6 @@ async def run_training_job(
                 'completed_at': datetime.utcnow().isoformat() + 'Z'
             })
             
-            # Update database
             try:
                 conn = psycopg2.connect(postgres_uri)
                 cursor = conn.cursor()
@@ -166,6 +180,7 @@ async def run_training_job(
             
     except Exception as e:
         logger.error(f"❌ Training error: {training_id} - {str(e)}")
+        logger.error(traceback.format_exc())
         
         update_training_status(training_id, {
             'training_id': training_id,
@@ -176,6 +191,16 @@ async def run_training_job(
 
 # ===== API Endpoints =====
 
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "service": "lora-training",
+        "version": "1.0.0",
+        "status": "online",
+        "timestamp": datetime.utcnow().isoformat() + 'Z'
+    }
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
@@ -184,7 +209,8 @@ async def health_check():
         "service": "lora-training",
         "timestamp": datetime.utcnow().isoformat() + 'Z',
         "output_path": OUTPUT_PATH,
-        "model_name": MODEL_NAME
+        "model_name": MODEL_NAME,
+        "active_trainings": len([s for s in training_status.values() if s.get('status') == 'running'])
     }
 
 @app.post("/train", response_model=TrainingResponse)
@@ -194,14 +220,12 @@ async def start_training(
 ):
     """Start a new training job"""
     try:
-        # Validate inputs
         if not request.user_id or not request.adapter_version:
             raise HTTPException(
                 status_code=400,
                 detail="user_id and adapter_version are required"
             )
         
-        # Use provided or env postgres URI
         postgres_uri = request.postgres_uri or POSTGRES_URI
         if not postgres_uri:
             raise HTTPException(
@@ -210,11 +234,8 @@ async def start_training(
             )
         
         model_name = request.model_name or MODEL_NAME
-        
-        # Generate training ID
         training_id = f"train-{request.user_id[:8]}-{request.adapter_version}"
         
-        # Check if already running
         existing = get_training_status(training_id)
         if existing and existing['status'] == 'running':
             raise HTTPException(
@@ -222,7 +243,6 @@ async def start_training(
                 detail=f"Training already in progress: {training_id}"
             )
         
-        # Initialize status
         update_training_status(training_id, {
             'training_id': training_id,
             'status': 'pending',
@@ -231,7 +251,6 @@ async def start_training(
             'created_at': datetime.utcnow().isoformat() + 'Z'
         })
         
-        # Start training in background
         background_tasks.add_task(
             run_training_job,
             training_id=training_id,
@@ -258,6 +277,7 @@ async def start_training(
         raise
     except Exception as e:
         logger.error(f"❌ Start training error: {str(e)}")
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/status/{training_id}", response_model=StatusResponse)
@@ -298,7 +318,6 @@ async def cancel_training(training_id: str):
             detail=f"Training is not running: {status['status']}"
         )
     
-    # Update status to cancelled
     update_training_status(training_id, {
         **status,
         'status': 'cancelled',
@@ -311,13 +330,13 @@ async def cancel_training(training_id: str):
         "training_id": training_id
     }
 
-# ===== Startup/Shutdown =====
+# ===== Startup/Shutdown Events =====
 
 @app.on_event("startup")
 async def startup_event():
     """Startup event"""
     logger.info("="*60)
-    logger.info("🚀 LoRA Training Service Started")
+    logger.info("✅ FastAPI Application Started")
     logger.info("="*60)
     logger.info(f"📂 Output Path: {OUTPUT_PATH}")
     logger.info(f"📦 Model: {MODEL_NAME}")
@@ -327,16 +346,28 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Shutdown event"""
-    logger.info("👋 LoRA Training Service Shutting Down")
+    logger.info("👋 FastAPI Application Shutting Down")
 
-# ===== Main =====
+# ===== Main Entry Point =====
 
 if __name__ == "__main__":
     import uvicorn
     
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=API_PORT,
-        log_level="info"
-    )
+    logger.info("="*60)
+    logger.info("🌐 Starting Uvicorn Server...")
+    logger.info(f"   Host: 0.0.0.0")
+    logger.info(f"   Port: {API_PORT}")
+    logger.info("="*60)
+    
+    try:
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=API_PORT,
+            log_level="info",
+            access_log=True
+        )
+    except Exception as e:
+        logger.error(f"❌ Uvicorn failed to start: {e}")
+        logger.error(traceback.format_exc())
+        sys.exit(1)
