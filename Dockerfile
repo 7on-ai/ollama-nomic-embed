@@ -32,10 +32,14 @@ RUN python3 -c "from transformers import AutoModelForCausalLM, AutoTokenizer; \
     AutoModelForCausalLM.from_pretrained('TinyLlama/TinyLlama-1.1B-Chat-v1.0'); \
     AutoTokenizer.from_pretrained('TinyLlama/TinyLlama-1.1B-Chat-v1.0')"
 
-# Copy training script and API server
+# Copy scripts
 COPY scripts/train_complete.py /workspace/scripts/train_complete.py
 COPY scripts/api_server.py /workspace/scripts/api_server.py
 RUN chmod +x /workspace/scripts/*.py
+
+# ✅ NEW: Copy entrypoint wrapper
+COPY scripts/entrypoint.sh /workspace/entrypoint.sh
+RUN chmod +x /workspace/entrypoint.sh
 
 # Environment
 ENV OUTPUT_PATH=/models/adapters
@@ -45,5 +49,5 @@ ENV API_PORT=8000
 # Expose API port
 EXPOSE 8000
 
-# Start API server
-CMD ["python3", "/workspace/scripts/api_server.py"]
+# ✅ Use entrypoint wrapper to ensure startup
+ENTRYPOINT ["/workspace/entrypoint.sh"]
