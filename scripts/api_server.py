@@ -44,7 +44,7 @@ except Exception as e:
 
 # ===== Configuration =====
 API_PORT = int(os.environ.get('API_PORT', 8000))
-OUTPUT_PATH = os.environ.get('OUTPUT_PATH', '/models/adapters')
+OUTPUT_PATH = os.environ.get('OUTPUT_PATH', '/workspace/adapters')
 POSTGRES_URI = os.environ.get('POSTGRES_URI', '')
 MODEL_NAME = os.environ.get('MODEL_NAME', 'TinyLlama/TinyLlama-1.1B-Chat-v1.0')
 

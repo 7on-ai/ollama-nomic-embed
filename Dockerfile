@@ -38,7 +38,7 @@ COPY scripts/api_server.py /workspace/scripts/api_server.py
 RUN chmod +x /workspace/scripts/*.py
 
 # Environment
-ENV OUTPUT_PATH=/models/adapters
+ENV OUTPUT_PATH=/workspace/adapters
 ENV PYTHONUNBUFFERED=1
 ENV API_PORT=8000
 
