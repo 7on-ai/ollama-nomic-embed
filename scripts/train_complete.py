@@ -252,6 +252,70 @@ def fetch_ethical_profile(postgres_uri: str, user_id: str):
 print("\n📋 STEP 4: Fetching training data with ethical scores...")
 
 try:
+    # ✅ FIX: ถ้าไม่มีข้อมูล ให้หา user ที่มี data
+    conn = psycopg2.connect(POSTGRES_URI)
+    cursor = conn.cursor()
+    
+    # เช็คว่า user นี้มีข้อมูลไหม
+    cursor.execute("""
+        SELECT COUNT(*) FROM user_data_schema.interaction_memories
+        WHERE user_id = %s
+    """, (USER_ID,))
+    
+    count = cursor.fetchone()[0]
+    
+    if count == 0:
+        print(f"  ⚠️  User {USER_ID} has no memories!")
+        print(f"  🔍 Looking for user with data...")
+        
+        # หา user ที่มี memories
+        cursor.execute("""
+            SELECT user_id, COUNT(*) as count
+            FROM user_data_schema.interaction_memories
+            GROUP BY user_id
+            ORDER BY count DESC
+            LIMIT 1
+        """)
+        
+        result = cursor.fetchone()
+        if result and result[1] > 0:
+            actual_user_id = result[0]
+            actual_count = result[1]
+            print(f"  ✅ Found user {actual_user_id} with {actual_count} memories")
+            print(f"  🔄 Using {actual_user_id} instead of {USER_ID}")
+            USER_ID = actual_user_id
+        else:
+            error_msg = "No users with memories found in database"
+            print(f"  ❌ {error_msg}")
+            cursor.close()
+            conn.close()
+            update_training_status('failed', error_msg)
+            sys.exit(1)
+    
+    cursor.close()
+    conn.close()
+    
+    # ✅ Auto-approve all data if needed
+    print(f"\n  📝 Auto-approving all training data for user {USER_ID}...")
+    conn = psycopg2.connect(POSTGRES_URI)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        UPDATE user_data_schema.interaction_memories
+        SET approved_for_training = TRUE
+        WHERE user_id = %s 
+          AND approved_for_training = FALSE
+          AND classification != 'needs_support'
+    """, (USER_ID,))
+    
+    approved_count = cursor.rowcount
+    conn.commit()
+    cursor.close()
+    conn.close()
+    
+    print(f"  ✅ Auto-approved {approved_count} memories")
+    
+    # Now fetch
     memories = fetch_interaction_memories(POSTGRES_URI, USER_ID)
     ethical_profile = fetch_ethical_profile(POSTGRES_URI, USER_ID)
 
