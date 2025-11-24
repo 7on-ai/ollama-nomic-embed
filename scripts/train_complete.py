@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 LoRA Training Pipeline - Ethical Growth System WITH DEBUG LOGS
-เก็บ ethical scoring ไว้ทั้งหมด แต่เพิ่ม logs เพื่อหา root cause
+✅ เก็บ ethical scoring ไว้ทั้งหมด
+✅ เพิ่ม DB update เมื่อเสร็จหรือล้มเหลว
 """
 
 import os
@@ -102,7 +103,47 @@ if not POSTGRES_URI or not USER_ID:
     sys.exit(1)
 
 OUTPUT_DIR = os.path.join(OUTPUT_BASE, USER_ID, ADAPTER_VERSION)
+TRAINING_ID = f"train-{USER_ID[:8]}-{ADAPTER_VERSION}"
+
 print(f"  OUTPUT_DIR: {OUTPUT_DIR}")
+print(f"  TRAINING_ID: {TRAINING_ID}")
+
+# ===== ✅ NEW: DB Update Helper =====
+def update_training_status(status: str, error_message: str = None):
+    """Update training_jobs table in database"""
+    try:
+        print(f"\n📊 Updating DB: status = {status}")
+        conn = psycopg2.connect(POSTGRES_URI)
+        cursor = conn.cursor()
+        
+        if status == 'completed':
+            cursor.execute("""
+                UPDATE user_data_schema.training_jobs
+                SET status = 'completed',
+                    completed_at = NOW(),
+                    error_message = NULL,
+                    updated_at = NOW()
+                WHERE job_id = %s
+            """, (TRAINING_ID,))
+            print(f"  ✅ DB updated: {status}")
+            
+        elif status == 'failed':
+            cursor.execute("""
+                UPDATE user_data_schema.training_jobs
+                SET status = 'failed',
+                    completed_at = NOW(),
+                    error_message = %s,
+                    updated_at = NOW()
+                WHERE job_id = %s
+            """, (error_message, TRAINING_ID))
+            print(f"  ✅ DB updated: {status} ({error_message})")
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+    except Exception as e:
+        print(f"  ⚠️  DB update failed: {e}")
 
 # ===== STEP 3: Test database connection =====
 print("\n📋 STEP 3: Testing database connection...")
@@ -118,6 +159,7 @@ except Exception as e:
     print(f"  ❌ Database connection failed: {e}")
     import traceback
     traceback.print_exc()
+    update_training_status('failed', f"DB connection error: {str(e)}")
     sys.exit(1)
 
 # ===== Database Functions =====
@@ -227,15 +269,19 @@ try:
         print(f"     {cls}: {count}")
 
     if total_samples < CONFIG['min_samples_total']:
-        print(f"\n  ❌ ERROR: Need at least {CONFIG['min_samples_total']} samples (have {total_samples})")
+        error_msg = f"Need at least {CONFIG['min_samples_total']} samples (have {total_samples})"
+        print(f"\n  ❌ ERROR: {error_msg}")
+        update_training_status('failed', error_msg)
         sys.exit(1)
     
     print(f"  ✅ Data validation passed")
 
 except Exception as e:
-    print(f"\n  ❌ Data fetch failed: {e}")
+    error_msg = f"Data fetch failed: {str(e)}"
+    print(f"\n  ❌ {error_msg}")
     import traceback
     traceback.print_exc()
+    update_training_status('failed', error_msg)
     sys.exit(1)
 
 # ===== STEP 5: Load model =====
@@ -263,9 +309,11 @@ try:
     print(f"  📊 Parameters: {model.num_parameters():,}")
 
 except Exception as e:
-    print(f"\n  ❌ Model loading failed: {e}")
+    error_msg = f"Model loading failed: {str(e)}"
+    print(f"\n  ❌ {error_msg}")
     import traceback
     traceback.print_exc()
+    update_training_status('failed', error_msg)
     sys.exit(1)
 
 gc.collect()
@@ -290,13 +338,11 @@ def create_ethical_training_pairs(memories):
             
         elif classification == 'challenge_memory':
             instruction = 'Respond with compassion and support to a challenge'
-            # ✅ Use gentle_guidance if available
             output = item.get('gentle_guidance') or f"I understand this is challenging. {text}"
             weight = 2.0
             
         elif classification == 'wisdom_moment':
             instruction = 'Share wisdom and deeper insight'
-            # ✅ Add reflection prompt if available
             reflection = item.get('reflection_prompt', '')
             output = f"{text}\n\n💭 {reflection}" if reflection else text
             weight = 2.5
@@ -339,12 +385,12 @@ try:
     print(f"     Support: {CONFIG['support_weight']*100}%")
     
     # Group by classification
-    by_class = {}
+    pairs_by_class = {}
     for pair in all_pairs:
         cls = pair['classification']
-        if cls not in by_class:
-            by_class[cls] = []
-        by_class[cls].append(pair)
+        if cls not in pairs_by_class:
+            pairs_by_class[cls] = []
+        pairs_by_class[cls].append(pair)
     
     # Sample each category
     sampled = []
@@ -357,9 +403,9 @@ try:
         ('neutral_interaction', 'neutral_weight'),
         ('needs_support', 'support_weight'),
     ]:
-        if cls in by_class:
+        if cls in pairs_by_class:
             target = int(total * CONFIG[weight_key])
-            available = by_class[cls]
+            available = pairs_by_class[cls]
             sample_size = min(target, len(available))
             sampled.extend(random.sample(available, sample_size))
             print(f"     {cls}: sampled {sample_size}/{len(available)}")
@@ -401,9 +447,11 @@ try:
     print(f"  ✅ Dataset ready: {len(tokenized_dataset)} samples")
 
 except Exception as e:
-    print(f"\n  ❌ Dataset preparation failed: {e}")
+    error_msg = f"Dataset preparation failed: {str(e)}"
+    print(f"\n  ❌ {error_msg}")
     import traceback
     traceback.print_exc()
+    update_training_status('failed', error_msg)
     sys.exit(1)
 
 gc.collect()
@@ -426,9 +474,11 @@ try:
     model.print_trainable_parameters()
 
 except Exception as e:
-    print(f"\n  ❌ LoRA configuration failed: {e}")
+    error_msg = f"LoRA configuration failed: {str(e)}"
+    print(f"\n  ❌ {error_msg}")
     import traceback
     traceback.print_exc()
+    update_training_status('failed', error_msg)
     sys.exit(1)
 
 gc.collect()
@@ -476,9 +526,11 @@ try:
     print(f"     Final loss: {result.training_loss:.4f}")
 
 except Exception as e:
-    print(f"\n  ❌ Training failed: {e}")
+    error_msg = f"Training failed: {str(e)}"
+    print(f"\n  ❌ {error_msg}")
     import traceback
     traceback.print_exc()
+    update_training_status('failed', error_msg)
     sys.exit(1)
 
 # ===== STEP 9: Save model =====
@@ -493,6 +545,7 @@ try:
     metadata = {
         "user_id": USER_ID,
         "adapter_version": ADAPTER_VERSION,
+        "training_id": TRAINING_ID,
         "base_model": MODEL_NAME,
         "system": "ethical_growth",
         "data_stats": {
@@ -525,15 +578,22 @@ try:
         print(f"     {filename} ({size:,} bytes)")
 
 except Exception as e:
-    print(f"\n  ❌ Save failed: {e}")
+    error_msg = f"Save failed: {str(e)}"
+    print(f"\n  ❌ {error_msg}")
     import traceback
     traceback.print_exc()
+    update_training_status('failed', error_msg)
     sys.exit(1)
 
+# ===== ✅ STEP 10: Update DB Status to Completed =====
+print("\n📋 STEP 10: Updating database status...")
+update_training_status('completed')
+
 print("\n" + "="*60)
-print("✅ TRAINING COMPLETED SUCCESSFULLY")
+print("✅✅✅ TRAINING COMPLETED SUCCESSFULLY")
 print("="*60)
 print(f"📊 Summary:")
+print(f"   Training ID: {TRAINING_ID}")
 print(f"   Samples: {len(sampled)}")
 print(f"   Loss: {result.training_loss:.4f}")
 print(f"   Output: {OUTPUT_DIR}")
