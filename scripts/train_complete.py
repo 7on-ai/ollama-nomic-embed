@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-LoRA Training Pipeline - INCREMENTAL TRAINING
-✅ เทรนแบบสะสมประสบการณ์ (ไม่เริ่มใหม่ทุกครั้ง)
-✅ โหลด adapter เก่า + เทรนต่อด้วยข้อมูลใหม่
+LoRA Training Pipeline - INCREMENTAL TRAINING (FIXED)
+✅ เทรนแบบสะสมประสบการณ์
+✅ Fixed: Version management + Previous adapter detection
+✅ Debug output เต็มรูปแบบ
 """
 
 import os
@@ -13,51 +14,27 @@ import gc
 from datetime import datetime
 from pathlib import Path
 
-# ===== DEBUG: Print startup info =====
+# ===== Startup Info =====
 print("="*60)
-print("🚀 LoRA Incremental Training Script Starting")
+print("🚀 LoRA Incremental Training (FIXED VERSION)")
 print("="*60)
 print(f"Time: {datetime.utcnow().isoformat()}Z")
 print(f"Python: {sys.version}")
 print(f"Working Dir: {os.getcwd()}")
 print("="*60)
 
-# ===== STEP 1: Check imports =====
+# ===== Imports =====
 print("\n📋 STEP 1: Checking imports...")
 try:
     import torch
-    print(f"  ✅ PyTorch {torch.__version__}")
-except Exception as e:
-    print(f"  ❌ PyTorch import failed: {e}")
-    sys.exit(1)
-
-try:
     from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, DataCollatorForLanguageModeling
-    print(f"  ✅ Transformers imported")
-except Exception as e:
-    print(f"  ❌ Transformers import failed: {e}")
-    sys.exit(1)
-
-try:
     from peft import LoraConfig, get_peft_model, PeftModel, TaskType
-    print(f"  ✅ PEFT imported")
-except Exception as e:
-    print(f"  ❌ PEFT import failed: {e}")
-    sys.exit(1)
-
-try:
     from datasets import Dataset
-    print(f"  ✅ Datasets imported")
-except Exception as e:
-    print(f"  ❌ Datasets import failed: {e}")
-    sys.exit(1)
-
-try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
-    print(f"  ✅ psycopg2 imported")
+    print(f"  ✅ All imports successful")
 except Exception as e:
-    print(f"  ❌ psycopg2 import failed: {e}")
+    print(f"  ❌ Import failed: {e}")
     sys.exit(1)
 
 import warnings
@@ -70,7 +47,7 @@ CONFIG = {
     "lora_dropout": 0.05,
     "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
     "learning_rate": 2e-5,
-    "num_epochs": 2,  # ✅ ลดลงเพราะเทรนแบบ incremental
+    "num_epochs": 2,
     "batch_size": 1,
     "max_length": 512,
     "gradient_accumulation_steps": 4,
@@ -79,41 +56,31 @@ CONFIG = {
     "wisdom_weight": 0.25,
     "neutral_weight": 0.15,
     "support_weight": 0.05,
-    "min_samples_new": 3,  # ✅ ต้องมีอย่างน้อย 3 samples ใหม่
-    "max_samples_per_training": 500,  # ✅ จำกัดไว้ 500 samples ต่อครั้ง
+    "min_samples_new": 3,
+    "max_samples_per_training": 500,
 }
 
-print(f"\n📊 Config: {json.dumps(CONFIG, indent=2)}")
-
-# ===== STEP 2: Validate environment =====
-print("\n📋 STEP 2: Validating environment variables...")
+# ===== Environment =====
+print("\n📋 STEP 2: Validating environment...")
 POSTGRES_URI = os.environ.get("POSTGRES_URI")
 USER_ID = os.environ.get("USER_ID")
 MODEL_NAME = os.environ.get("MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-ADAPTER_VERSION = os.environ.get("ADAPTER_VERSION", "v1")
 OUTPUT_BASE = os.environ.get("OUTPUT_PATH", "/workspace/adapters")
 
 print(f"  POSTGRES_URI: {'✅ SET' if POSTGRES_URI else '❌ MISSING'}")
 print(f"  USER_ID: {USER_ID or '❌ MISSING'}")
 print(f"  MODEL_NAME: {MODEL_NAME}")
-print(f"  ADAPTER_VERSION: {ADAPTER_VERSION}")
 print(f"  OUTPUT_BASE: {OUTPUT_BASE}")
 
 if not POSTGRES_URI or not USER_ID:
     print("\n❌ FATAL: Missing required environment variables")
     sys.exit(1)
 
-OUTPUT_DIR = os.path.join(OUTPUT_BASE, USER_ID, ADAPTER_VERSION)
-TRAINING_ID = f"train-{USER_ID[:8]}-{ADAPTER_VERSION}"
-
-print(f"  OUTPUT_DIR: {OUTPUT_DIR}")
-print(f"  TRAINING_ID: {TRAINING_ID}")
-
-# ===== DB Update Helper =====
-def update_training_status(status: str, error_message: str = None):
-    """Update training_jobs table in database"""
+# ===== DB Helper Functions =====
+def update_training_status(training_id: str, status: str, error_message: str = None):
+    """Update training_jobs table"""
     try:
-        print(f"\n📊 Updating DB: status = {status}")
+        print(f"\n📊 Updating DB: job_id={training_id}, status={status}")
         conn = psycopg2.connect(POSTGRES_URI)
         cursor = conn.cursor()
         
@@ -125,8 +92,7 @@ def update_training_status(status: str, error_message: str = None):
                     error_message = NULL,
                     updated_at = NOW()
                 WHERE job_id = %s
-            """, (TRAINING_ID,))
-            print(f"  ✅ DB updated: {status}")
+            """, (training_id,))
             
         elif status == 'failed':
             cursor.execute("""
@@ -136,46 +102,95 @@ def update_training_status(status: str, error_message: str = None):
                     error_message = %s,
                     updated_at = NOW()
                 WHERE job_id = %s
-            """, (error_message, TRAINING_ID))
-            print(f"  ✅ DB updated: {status} ({error_message})")
+            """, (error_message, training_id))
         
         conn.commit()
         cursor.close()
         conn.close()
+        print(f"  ✅ DB updated successfully")
         
     except Exception as e:
         print(f"  ⚠️  DB update failed: {e}")
 
-# ===== STEP 3: Test database connection =====
-print("\n📋 STEP 3: Testing database connection...")
-try:
-    conn = psycopg2.connect(POSTGRES_URI)
-    cursor = conn.cursor()
-    cursor.execute("SELECT version()")
-    version = cursor.fetchone()[0]
-    print(f"  ✅ Connected: {version[:60]}...")
-    cursor.close()
-    conn.close()
-except Exception as e:
-    print(f"  ❌ Database connection failed: {e}")
-    import traceback
-    traceback.print_exc()
-    update_training_status('failed', f"DB connection error: {str(e)}")
-    sys.exit(1)
+def get_last_completed_training(postgres_uri: str, user_id: str):
+    """ดึงข้อมูลการเทรนล่าสุดที่สำเร็จ"""
+    try:
+        conn = psycopg2.connect(postgres_uri)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        query = """
+        SELECT job_id, adapter_version, completed_at, created_at
+        FROM user_data_schema.training_jobs
+        WHERE user_id = %s
+          AND status = 'completed'
+        ORDER BY completed_at DESC
+        LIMIT 1
+        """
+        cursor.execute(query, (user_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        return dict(row) if row else None
+        
+    except Exception as e:
+        print(f"  ⚠️  Query failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
-# ===== Database Functions =====
-def fetch_interaction_memories(postgres_uri: str, user_id: str, last_trained_at: str = None, limit: int = 500):
-    """
-    Fetch memories - ถ้ามี last_trained_at จะดึงเฉพาะที่ใหม่กว่า
-    """
-    print(f"\n  📊 Fetching memories...")
+def find_adapter_by_version(output_base: str, user_id: str, version: str):
+    """หา adapter ตาม version ที่ระบุ"""
+    adapter_path = os.path.join(output_base, user_id, version)
+    adapter_file = os.path.join(adapter_path, 'adapter_model.safetensors')
     
+    if os.path.exists(adapter_file):
+        return adapter_path
+    return None
+
+def get_next_version_number(postgres_uri: str, user_id: str):
+    """คำนวณ version number ถัดไป"""
+    try:
+        conn = psycopg2.connect(postgres_uri)
+        cursor = conn.cursor()
+        
+        # หา version ล่าสุด
+        cursor.execute("""
+            SELECT adapter_version
+            FROM user_data_schema.training_jobs
+            WHERE user_id = %s
+              AND status = 'completed'
+              AND adapter_version LIKE 'v%'
+            ORDER BY completed_at DESC
+            LIMIT 1
+        """, (user_id,))
+        
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if row and row[0]:
+            # Extract number from v1, v2, etc.
+            try:
+                last_num = int(row[0].replace('v', ''))
+                return f"v{last_num + 1}"
+            except:
+                return "v1"
+        
+        return "v1"  # ครั้งแรก
+        
+    except Exception as e:
+        print(f"  ⚠️  Version calc failed: {e}")
+        return "v1"
+
+def fetch_interaction_memories(postgres_uri: str, user_id: str, last_trained_at=None, limit: int = 500):
+    """Fetch memories - incremental if last_trained_at provided"""
     try:
         conn = psycopg2.connect(postgres_uri)
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
         if last_trained_at:
-            # ✅ ดึงเฉพาะข้อมูลใหม่
+            # ✅ Incremental: ดึงเฉพาะใหม่
             query = """
             SELECT text, classification, ethical_scores, gentle_guidance, 
                    reflection_prompt, training_weight, created_at
@@ -187,9 +202,9 @@ def fetch_interaction_memories(postgres_uri: str, user_id: str, last_trained_at:
             LIMIT %s
             """
             cursor.execute(query, (user_id, last_trained_at, limit))
-            print(f"  🔍 Mode: INCREMENTAL (after {last_trained_at})")
+            mode = "INCREMENTAL"
         else:
-            # ✅ ดึงทั้งหมด (ครั้งแรก)
+            # ✅ Full: ดึงทั้งหมด
             query = """
             SELECT text, classification, ethical_scores, gentle_guidance, 
                    reflection_prompt, training_weight, created_at
@@ -200,22 +215,17 @@ def fetch_interaction_memories(postgres_uri: str, user_id: str, last_trained_at:
             LIMIT %s
             """
             cursor.execute(query, (user_id, limit))
-            print(f"  🔍 Mode: FULL TRAINING (first time)")
+            mode = "FULL"
         
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
         
-        print(f"  ✅ Fetched {len(rows)} samples")
+        print(f"  ✅ Fetched {len(rows)} samples (mode: {mode})")
+        if last_trained_at:
+            print(f"     After: {last_trained_at}")
         
-        if rows:
-            sample = rows[0]
-            print(f"  📋 Sample:")
-            print(f"     Classification: {sample['classification']}")
-            print(f"     Text: {sample['text'][:50]}...")
-            print(f"     Created: {sample['created_at']}")
-        
-        return rows
+        return rows, mode
         
     except Exception as e:
         print(f"  ❌ Fetch failed: {e}")
@@ -241,120 +251,87 @@ def fetch_ethical_profile(postgres_uri: str, user_id: str):
         cursor.close()
         conn.close()
         
-        if row:
-            print(f"  ✅ Ethical Profile:")
-            print(f"     Growth Stage: {row['growth_stage']}/5")
-            print(f"     Self-Awareness: {row['self_awareness']:.2f}")
-            print(f"     Compassion: {row['compassion']:.2f}")
-            print(f"     Wisdom: {row['wisdom']:.2f}")
-        
-        return row
+        return dict(row) if row else None
     except Exception as e:
-        print(f"  ⚠️  No ethical profile found: {e}")
+        print(f"  ⚠️  No ethical profile: {e}")
         return None
 
-def get_last_training_info(postgres_uri: str, user_id: str):
-    """ดึงข้อมูลการเทรนครั้งล่าสุด"""
-    try:
-        conn = psycopg2.connect(postgres_uri)
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        
-        query = """
-        SELECT adapter_version, completed_at
-        FROM user_data_schema.training_jobs
-        WHERE user_id = %s
-          AND status = 'completed'
-        ORDER BY completed_at DESC
-        LIMIT 1
-        """
-        cursor.execute(query, (user_id,))
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
-        
-        return row
-    except Exception as e:
-        print(f"  ⚠️  No previous training found: {e}")
-        return None
+# ===== STEP 3: Test DB =====
+print("\n📋 STEP 3: Testing database connection...")
+try:
+    conn = psycopg2.connect(POSTGRES_URI)
+    cursor = conn.cursor()
+    cursor.execute("SELECT version()")
+    version = cursor.fetchone()[0]
+    print(f"  ✅ Connected: {version[:60]}...")
+    cursor.close()
+    conn.close()
+except Exception as e:
+    print(f"  ❌ Database connection failed: {e}")
+    sys.exit(1)
 
-def find_previous_adapter(output_base: str, user_id: str):
-    """หา adapter เวอร์ชันล่าสุดที่มีอยู่"""
-    user_dir = os.path.join(output_base, user_id)
-    
-    if not os.path.exists(user_dir):
-        return None
-    
-    # หา version directories
-    versions = []
-    for item in os.listdir(user_dir):
-        path = os.path.join(user_dir, item)
-        if os.path.isdir(path) and item.startswith('v'):
-            adapter_file = os.path.join(path, 'adapter_model.bin')
-            if os.path.exists(adapter_file):
-                versions.append((item, path))
-    
-    if not versions:
-        return None
-    
-    # Sort by version (newest first)
-    versions.sort(reverse=True)
-    return versions[0][1]  # Return path
-
-# ===== STEP 4: Check for previous adapter =====
+# ===== STEP 4: Check Previous Training (FIXED) =====
 print("\n📋 STEP 4: Checking for previous training...")
+print(f"  OUTPUT_BASE: {OUTPUT_BASE}")
+print(f"  USER_ID: {USER_ID}")
+print(f"  Looking for: {os.path.join(OUTPUT_BASE, USER_ID)}")
 
-last_training = get_last_training_info(POSTGRES_URI, USER_ID)
-previous_adapter_path = find_previous_adapter(OUTPUT_BASE, USER_ID)
+# 1. Check database for last completed training
+last_training = get_last_completed_training(POSTGRES_URI, USER_ID)
 
-if last_training and previous_adapter_path:
-    print(f"  ✅ Found previous training:")
+if last_training:
+    print(f"\n  ✅ Found previous training in DB:")
+    print(f"     Job ID: {last_training['job_id']}")
     print(f"     Version: {last_training['adapter_version']}")
     print(f"     Completed: {last_training['completed_at']}")
-    print(f"     Adapter: {previous_adapter_path}")
-    IS_INCREMENTAL = True
-    LAST_TRAINED_AT = last_training['completed_at']
+    
+    # 2. Try to find the adapter files
+    previous_adapter_path = find_adapter_by_version(
+        OUTPUT_BASE, 
+        USER_ID, 
+        last_training['adapter_version']
+    )
+    
+    if previous_adapter_path:
+        print(f"     Adapter found: {previous_adapter_path}")
+        IS_INCREMENTAL = True
+        LAST_TRAINED_AT = last_training['completed_at']
+        PREVIOUS_VERSION = last_training['adapter_version']
+        NEW_VERSION = get_next_version_number(POSTGRES_URI, USER_ID)
+    else:
+        print(f"     ⚠️  Adapter files not found - will train from scratch")
+        IS_INCREMENTAL = False
+        LAST_TRAINED_AT = None
+        previous_adapter_path = None
+        PREVIOUS_VERSION = None
+        NEW_VERSION = "v1"
 else:
-    print(f"  📝 No previous training - this is the first training")
+    print(f"\n  📝 No previous training found - this is the first training")
     IS_INCREMENTAL = False
     LAST_TRAINED_AT = None
     previous_adapter_path = None
+    PREVIOUS_VERSION = None
+    NEW_VERSION = "v1"
 
-# ===== STEP 5: Fetch training data =====
+# Set final paths
+ADAPTER_VERSION = NEW_VERSION
+OUTPUT_DIR = os.path.join(OUTPUT_BASE, USER_ID, ADAPTER_VERSION)
+TRAINING_ID = f"train-{USER_ID[:8]}-{ADAPTER_VERSION}"
+
+print(f"\n  📊 Training Configuration:")
+print(f"     Mode: {'INCREMENTAL' if IS_INCREMENTAL else 'FULL'}")
+print(f"     Previous Version: {PREVIOUS_VERSION or 'None'}")
+print(f"     New Version: {NEW_VERSION}")
+print(f"     Training ID: {TRAINING_ID}")
+print(f"     Output: {OUTPUT_DIR}")
+
+# ===== STEP 5: Fetch Data =====
 print("\n📋 STEP 5: Fetching training data...")
 
 try:
-    # ✅ Auto-approve if needed
+    # Auto-approve memories
     conn = psycopg2.connect(POSTGRES_URI)
     cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT COUNT(*) FROM user_data_schema.interaction_memories
-        WHERE user_id = %s
-    """, (USER_ID,))
-    
-    count = cursor.fetchone()[0]
-    
-    if count == 0:
-        print(f"  ⚠️  User {USER_ID} has no memories!")
-        cursor.execute("""
-            SELECT user_id, COUNT(*) as count
-            FROM user_data_schema.interaction_memories
-            GROUP BY user_id
-            ORDER BY count DESC
-            LIMIT 1
-        """)
-        
-        result = cursor.fetchone()
-        if result and result[1] > 0:
-            USER_ID = result[0]
-            print(f"  ✅ Using user {USER_ID} instead (has {result[1]} memories)")
-        else:
-            error_msg = "No users with memories found"
-            print(f"  ❌ {error_msg}")
-            cursor.close()
-            conn.close()
-            update_training_status('failed', error_msg)
-            sys.exit(1)
     
     cursor.execute("""
         UPDATE user_data_schema.interaction_memories
@@ -368,11 +345,10 @@ try:
     conn.commit()
     cursor.close()
     conn.close()
-    
     print(f"  ✅ Auto-approved {approved_count} memories")
     
     # Fetch memories
-    memories = fetch_interaction_memories(
+    memories, fetch_mode = fetch_interaction_memories(
         POSTGRES_URI, 
         USER_ID, 
         last_trained_at=LAST_TRAINED_AT,
@@ -380,11 +356,12 @@ try:
     )
     
     ethical_profile = fetch_ethical_profile(POSTGRES_URI, USER_ID)
-
+    
+    # Summary
     total_samples = len(memories)
     print(f"\n  📊 Data Summary:")
+    print(f"     Mode: {fetch_mode}")
     print(f"     Total samples: {total_samples}")
-    print(f"     Training mode: {'INCREMENTAL' if IS_INCREMENTAL else 'FULL'}")
     
     by_class = {}
     for mem in memories:
@@ -393,38 +370,34 @@ try:
     
     for cls, count in by_class.items():
         print(f"     {cls}: {count}")
-
-    # ✅ Validation
+    
+    # Validation
     min_required = CONFIG['min_samples_new'] if IS_INCREMENTAL else 10
     if total_samples < min_required:
         error_msg = f"Need at least {min_required} samples (have {total_samples})"
-        print(f"\n  ❌ ERROR: {error_msg}")
-        update_training_status('failed', error_msg)
+        print(f"\n  ❌ {error_msg}")
+        update_training_status(TRAINING_ID, 'failed', error_msg)
         sys.exit(1)
     
-    print(f"  ✅ Data validation passed")
+    print(f"  ✅ Validation passed")
 
 except Exception as e:
     error_msg = f"Data fetch failed: {str(e)}"
     print(f"\n  ❌ {error_msg}")
     import traceback
     traceback.print_exc()
-    update_training_status('failed', error_msg)
+    update_training_status(TRAINING_ID, 'failed', error_msg)
     sys.exit(1)
 
-# ===== STEP 6: Load model =====
-print("\n📋 STEP 6: Loading base model...")
-print(f"  Model: {MODEL_NAME}")
-print(f"  Device: CPU")
+# ===== STEP 6: Load Model =====
+print("\n📋 STEP 6: Loading model...")
 
 try:
-    print(f"\n  📥 Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     print(f"  ✅ Tokenizer loaded")
     
-    print(f"\n  📥 Loading model...")
     base_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch.float32,
@@ -434,68 +407,59 @@ try:
     )
     print(f"  ✅ Base model loaded")
     
-    # ✅ Load previous adapter if exists
+    # Load previous adapter if incremental
     if IS_INCREMENTAL and previous_adapter_path:
-        print(f"\n  🔄 Loading previous adapter from: {previous_adapter_path}")
+        print(f"\n  🔄 Loading previous adapter...")
+        print(f"     Path: {previous_adapter_path}")
         try:
             model = PeftModel.from_pretrained(base_model, previous_adapter_path)
-            print(f"  ✅ Previous adapter loaded - will train incrementally")
+            print(f"  ✅ Previous adapter loaded - training incrementally")
         except Exception as e:
-            print(f"  ⚠️  Failed to load previous adapter: {e}")
+            print(f"  ⚠️  Failed to load adapter: {e}")
             print(f"  🔄 Falling back to full training")
             IS_INCREMENTAL = False
             model = base_model
     else:
         model = base_model
-    
-    print(f"  📊 Parameters: {model.num_parameters():,}")
+        print(f"  📝 Starting fresh training")
 
 except Exception as e:
     error_msg = f"Model loading failed: {str(e)}"
     print(f"\n  ❌ {error_msg}")
-    import traceback
-    traceback.print_exc()
-    update_training_status('failed', error_msg)
+    update_training_status(TRAINING_ID, 'failed', error_msg)
     sys.exit(1)
 
 gc.collect()
 
-# ===== STEP 7: Prepare dataset =====
+# ===== STEP 7: Prepare Dataset =====
 print("\n📋 STEP 7: Preparing dataset...")
 
 def create_ethical_training_pairs(memories):
-    """Create training pairs with ethical context"""
     pairs = []
-    
     for item in memories:
         classification = item['classification']
         text = item['text']
-        ethical_scores = item.get('ethical_scores', {})
         
         if classification == 'growth_memory':
             instruction = 'Respond supportively to encourage personal growth'
             output = text
             weight = 1.5
-            
         elif classification == 'challenge_memory':
             instruction = 'Respond with compassion and support to a challenge'
             output = item.get('gentle_guidance') or f"I understand this is challenging. {text}"
             weight = 2.0
-            
         elif classification == 'wisdom_moment':
             instruction = 'Share wisdom and deeper insight'
             reflection = item.get('reflection_prompt', '')
             output = f"{text}\n\n💭 {reflection}" if reflection else text
             weight = 2.5
-            
         elif classification == 'neutral_interaction':
             instruction = 'Respond naturally to everyday conversation'
             output = text
             weight = 0.8
-            
         elif classification == 'needs_support':
             instruction = 'Provide caring support with empathy'
-            output = item.get('gentle_guidance') or "I care about you. Please reach out for support."
+            output = item.get('gentle_guidance') or "I care about you."
             weight = 1.0
         else:
             instruction = 'Respond helpfully'
@@ -508,7 +472,6 @@ def create_ethical_training_pairs(memories):
             'output': output,
             'weight': weight,
             'classification': classification,
-            'ethical_scores': ethical_scores
         })
     
     return pairs
@@ -516,13 +479,7 @@ def create_ethical_training_pairs(memories):
 try:
     all_pairs = create_ethical_training_pairs(memories)
     
-    print(f"\n  📊 Sampling strategy:")
-    print(f"     Growth: {CONFIG['growth_weight']*100}%")
-    print(f"     Challenge: {CONFIG['challenge_weight']*100}%")
-    print(f"     Wisdom: {CONFIG['wisdom_weight']*100}%")
-    print(f"     Neutral: {CONFIG['neutral_weight']*100}%")
-    print(f"     Support: {CONFIG['support_weight']*100}%")
-    
+    # Sampling strategy
     pairs_by_class = {}
     for pair in all_pairs:
         cls = pair['classification']
@@ -533,6 +490,7 @@ try:
     sampled = []
     total = len(all_pairs)
     
+    print(f"\n  📊 Sampling strategy:")
     for cls, weight_key in [
         ('growth_memory', 'growth_weight'),
         ('challenge_memory', 'challenge_weight'),
@@ -545,10 +503,9 @@ try:
             available = pairs_by_class[cls]
             sample_size = min(target, len(available))
             sampled.extend(random.sample(available, sample_size))
-            print(f"     {cls}: sampled {sample_size}/{len(available)}")
+            print(f"     {cls}: {sample_size}/{len(available)} ({CONFIG[weight_key]*100}%)")
     
     random.shuffle(sampled)
-    
     print(f"\n  ✅ Created {len(sampled)} training pairs")
     
     texts = [
@@ -565,7 +522,6 @@ try:
             max_length=CONFIG["max_length"],
         )
     
-    print(f"\n  📝 Tokenizing...")
     tokenized_dataset = dataset.map(
         tokenize_function,
         batched=True,
@@ -574,19 +530,16 @@ try:
     print(f"  ✅ Dataset ready: {len(tokenized_dataset)} samples")
 
 except Exception as e:
-    error_msg = f"Dataset preparation failed: {str(e)}"
+    error_msg = f"Dataset prep failed: {str(e)}"
     print(f"\n  ❌ {error_msg}")
-    import traceback
-    traceback.print_exc()
-    update_training_status('failed', error_msg)
+    update_training_status(TRAINING_ID, 'failed', error_msg)
     sys.exit(1)
 
 gc.collect()
 
-# ===== STEP 8: Configure LoRA (only if not incremental) =====
+# ===== STEP 8: Configure LoRA =====
 if not IS_INCREMENTAL:
     print("\n📋 STEP 8: Configuring LoRA...")
-    
     try:
         lora_config = LoraConfig(
             r=CONFIG['r'],
@@ -600,27 +553,22 @@ if not IS_INCREMENTAL:
         model = get_peft_model(model, lora_config)
         print(f"  ✅ LoRA configured")
         model.print_trainable_parameters()
-    
     except Exception as e:
-        error_msg = f"LoRA configuration failed: {str(e)}"
+        error_msg = f"LoRA config failed: {str(e)}"
         print(f"\n  ❌ {error_msg}")
-        import traceback
-        traceback.print_exc()
-        update_training_status('failed', error_msg)
+        update_training_status(TRAINING_ID, 'failed', error_msg)
         sys.exit(1)
 else:
-    print("\n📋 STEP 8: Using existing LoRA adapter (incremental mode)")
+    print("\n📋 STEP 8: Using existing adapter (incremental mode)")
     model.print_trainable_parameters()
 
 gc.collect()
 
 # ===== STEP 9: Training =====
 print("\n📋 STEP 9: Starting training...")
+print(f"  Mode: {'INCREMENTAL' if IS_INCREMENTAL else 'FULL'}")
 print(f"  Output: {OUTPUT_DIR}")
 print(f"  Epochs: {CONFIG['num_epochs']}")
-print(f"  Batch size: {CONFIG['batch_size']}")
-print(f"  Learning rate: {CONFIG['learning_rate']}")
-print(f"  Mode: {'INCREMENTAL' if IS_INCREMENTAL else 'FULL'}")
 
 try:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -659,12 +607,10 @@ try:
 except Exception as e:
     error_msg = f"Training failed: {str(e)}"
     print(f"\n  ❌ {error_msg}")
-    import traceback
-    traceback.print_exc()
-    update_training_status('failed', error_msg)
+    update_training_status(TRAINING_ID, 'failed', error_msg)
     sys.exit(1)
 
-# ===== STEP 10: Save model =====
+# ===== STEP 10: Save =====
 print("\n📋 STEP 10: Saving model...")
 
 try:
@@ -677,59 +623,44 @@ try:
         "adapter_version": ADAPTER_VERSION,
         "training_id": TRAINING_ID,
         "base_model": MODEL_NAME,
-        "system": "ethical_growth",
         "training_mode": "incremental" if IS_INCREMENTAL else "full",
-        "previous_adapter": previous_adapter_path if IS_INCREMENTAL else None,
+        "previous_version": PREVIOUS_VERSION,
         "data_stats": {
             "total_samples": total_samples,
+            "trained_samples": len(sampled),
             "by_classification": by_class,
             "last_trained_at": str(LAST_TRAINED_AT) if LAST_TRAINED_AT else None,
         },
-        "ethical_profile": {
-            "growth_stage": ethical_profile.get('growth_stage') if ethical_profile else None,
-            "self_awareness": ethical_profile.get('self_awareness') if ethical_profile else None,
-            "compassion": ethical_profile.get('compassion') if ethical_profile else None,
-            "wisdom": ethical_profile.get('wisdom') if ethical_profile else None,
-        } if ethical_profile else None,
+        "ethical_profile": ethical_profile,
         "config": CONFIG,
         "metrics": {"loss": float(result.training_loss)},
         "trained_at": datetime.utcnow().isoformat() + "Z",
-        "device": "cpu",
     }
     
-    meta_path = os.path.join(OUTPUT_DIR, "metadata.json")
-    with open(meta_path, "w") as f:
+    with open(os.path.join(OUTPUT_DIR, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
     
     print(f"  ✅ Metadata saved")
-    
-    print(f"\n  📁 Output files:")
-    for filename in os.listdir(OUTPUT_DIR):
-        filepath = os.path.join(OUTPUT_DIR, filename)
-        size = os.path.getsize(filepath)
-        print(f"     {filename} ({size:,} bytes)")
 
 except Exception as e:
     error_msg = f"Save failed: {str(e)}"
     print(f"\n  ❌ {error_msg}")
-    import traceback
-    traceback.print_exc()
-    update_training_status('failed', error_msg)
+    update_training_status(TRAINING_ID, 'failed', error_msg)
     sys.exit(1)
 
 # ===== STEP 11: Update DB =====
-print("\n📋 STEP 11: Updating database status...")
-update_training_status('completed')
+print("\n📋 STEP 11: Updating database...")
+update_training_status(TRAINING_ID, 'completed')
 
 print("\n" + "="*60)
-print("✅✅✅ INCREMENTAL TRAINING COMPLETED")
+print("✅✅✅ TRAINING COMPLETED")
 print("="*60)
 print(f"📊 Summary:")
 print(f"   Training ID: {TRAINING_ID}")
 print(f"   Mode: {'INCREMENTAL' if IS_INCREMENTAL else 'FULL'}")
-print(f"   New samples: {len(sampled)}")
+print(f"   Previous: {PREVIOUS_VERSION or 'None'}")
+print(f"   New Version: {ADAPTER_VERSION}")
+print(f"   Samples: {len(sampled)}/{total_samples}")
 print(f"   Loss: {result.training_loss:.4f}")
 print(f"   Output: {OUTPUT_DIR}")
-if ethical_profile:
-    print(f"   Ethical Profile: Stage {ethical_profile.get('growth_stage')}/5")
 print("="*60)

@@ -66,7 +66,6 @@ async def run_training_job(training_id: str, user_id: str, adapter_version: str,
             'POSTGRES_URI': postgres_uri,
             'USER_ID': user_id,
             'MODEL_NAME': model_name,
-            'ADAPTER_VERSION': adapter_version,
             'OUTPUT_PATH': OUTPUT_PATH,
         })
         
