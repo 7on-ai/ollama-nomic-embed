@@ -4,6 +4,7 @@ LoRA Training Pipeline - INCREMENTAL TRAINING (FIXED)
 ✅ เทรนแบบสะสมประสบการณ์
 ✅ Fixed: Version management + Previous adapter detection
 ✅ Debug output เต็มรูปแบบ
+✅ Auto scale down to 0 after completion
 """
 
 import os
@@ -11,6 +12,7 @@ import sys
 import json
 import random
 import gc
+import requests
 from datetime import datetime
 from pathlib import Path
 
@@ -66,15 +68,48 @@ POSTGRES_URI = os.environ.get("POSTGRES_URI")
 USER_ID = os.environ.get("USER_ID")
 MODEL_NAME = os.environ.get("MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 OUTPUT_BASE = os.environ.get("OUTPUT_PATH", "/workspace/adapters")
+NORTHFLANK_API_TOKEN = os.environ.get("NORTHFLANK_API_TOKEN")
+NORTHFLANK_PROJECT_ID = os.environ.get("NORTHFLANK_PROJECT_ID")
 
 print(f"  POSTGRES_URI: {'✅ SET' if POSTGRES_URI else '❌ MISSING'}")
 print(f"  USER_ID: {USER_ID or '❌ MISSING'}")
 print(f"  MODEL_NAME: {MODEL_NAME}")
 print(f"  OUTPUT_BASE: {OUTPUT_BASE}")
+print(f"  NORTHFLANK_API_TOKEN: {'✅ SET' if NORTHFLANK_API_TOKEN else '⚠️  MISSING (scale down disabled)'}")
+print(f"  NORTHFLANK_PROJECT_ID: {'✅ SET' if NORTHFLANK_PROJECT_ID else '⚠️  MISSING (scale down disabled)'}")
 
 if not POSTGRES_URI or not USER_ID:
     print("\n❌ FATAL: Missing required environment variables")
     sys.exit(1)
+
+# ===== Scale Down Function =====
+def scale_service_to_zero():
+    """Scale Northflank service to 0 replicas"""
+    if not NORTHFLANK_API_TOKEN or not NORTHFLANK_PROJECT_ID:
+        print("\n⚠️  Scale down skipped: Missing Northflank credentials")
+        return
+    
+    try:
+        print("\n📊 Scaling service to 0...")
+        url = f"https://api.northflank.com/v1/projects/{NORTHFLANK_PROJECT_ID}/services/lora-training/scale"
+        
+        response = requests.post(
+            url,
+            headers={
+                'Authorization': f'Bearer {NORTHFLANK_API_TOKEN}',
+                'Content-Type': 'application/json',
+            },
+            json={'instances': 0},
+            timeout=30
+        )
+        
+        if response.ok:
+            print("  ✅ Successfully scaled to 0 replicas")
+        else:
+            print(f"  ⚠️  Scale down failed: {response.status_code} - {response.text}")
+            
+    except Exception as e:
+        print(f"  ⚠️  Scale down error: {e}")
 
 # ===== DB Helper Functions =====
 def update_training_status(training_id: str, status: str, error_message: str = None):
@@ -377,6 +412,7 @@ try:
         error_msg = f"Need at least {min_required} samples (have {total_samples})"
         print(f"\n  ❌ {error_msg}")
         update_training_status(TRAINING_ID, 'failed', error_msg)
+        scale_service_to_zero()  # ✅ Scale down on error
         sys.exit(1)
     
     print(f"  ✅ Validation passed")
@@ -387,6 +423,7 @@ except Exception as e:
     import traceback
     traceback.print_exc()
     update_training_status(TRAINING_ID, 'failed', error_msg)
+    scale_service_to_zero()  # ✅ Scale down on error
     sys.exit(1)
 
 # ===== STEP 6: Load Model =====
@@ -427,6 +464,7 @@ except Exception as e:
     error_msg = f"Model loading failed: {str(e)}"
     print(f"\n  ❌ {error_msg}")
     update_training_status(TRAINING_ID, 'failed', error_msg)
+    scale_service_to_zero()  # ✅ Scale down on error
     sys.exit(1)
 
 gc.collect()
@@ -533,6 +571,7 @@ except Exception as e:
     error_msg = f"Dataset prep failed: {str(e)}"
     print(f"\n  ❌ {error_msg}")
     update_training_status(TRAINING_ID, 'failed', error_msg)
+    scale_service_to_zero()  # ✅ Scale down on error
     sys.exit(1)
 
 gc.collect()
@@ -557,6 +596,7 @@ if not IS_INCREMENTAL:
         error_msg = f"LoRA config failed: {str(e)}"
         print(f"\n  ❌ {error_msg}")
         update_training_status(TRAINING_ID, 'failed', error_msg)
+        scale_service_to_zero()  # ✅ Scale down on error
         sys.exit(1)
 else:
     print("\n📋 STEP 8: Using existing adapter (incremental mode)")
@@ -608,6 +648,7 @@ except Exception as e:
     error_msg = f"Training failed: {str(e)}"
     print(f"\n  ❌ {error_msg}")
     update_training_status(TRAINING_ID, 'failed', error_msg)
+    scale_service_to_zero()  # ✅ Scale down on error
     sys.exit(1)
 
 # ===== STEP 10: Save =====
@@ -646,11 +687,16 @@ except Exception as e:
     error_msg = f"Save failed: {str(e)}"
     print(f"\n  ❌ {error_msg}")
     update_training_status(TRAINING_ID, 'failed', error_msg)
+    scale_service_to_zero()  # ✅ Scale down on error
     sys.exit(1)
 
 # ===== STEP 11: Update DB =====
 print("\n📋 STEP 11: Updating database...")
 update_training_status(TRAINING_ID, 'completed')
+
+# ===== STEP 12: Scale Down to 0 =====
+print("\n📋 STEP 12: Scaling down service...")
+scale_service_to_zero()  # ✅ Scale down after success
 
 print("\n" + "="*60)
 print("✅✅✅ TRAINING COMPLETED")
