@@ -3,6 +3,7 @@
 LoRA Training Pipeline - INCREMENTAL TRAINING (FIXED)
 ✅ Fixed: Proper gradient handling for incremental training
 ✅ Fixed: Ensure all LoRA parameters require grad
+✅ Fixed: Version increment logic
 """
 
 import os
@@ -12,6 +13,7 @@ import random
 import gc
 import requests
 import time
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -180,7 +182,7 @@ def find_adapter_by_version(output_base: str, user_id: str, version: str):
     return None
 
 def get_next_version_number(postgres_uri: str, user_id: str):
-    """Calculate next version number"""
+    """✅ FIXED: Calculate next version number correctly"""
     try:
         conn = psycopg2.connect(postgres_uri)
         cursor = conn.cursor()
@@ -190,7 +192,6 @@ def get_next_version_number(postgres_uri: str, user_id: str):
             FROM user_data_schema.training_jobs
             WHERE user_id = %s
               AND status = 'completed'
-              AND adapter_version LIKE 'v%'
             ORDER BY completed_at DESC
             LIMIT 1
         """, (user_id,))
@@ -199,17 +200,29 @@ def get_next_version_number(postgres_uri: str, user_id: str):
         cursor.close()
         conn.close()
         
-        if row and row[0]:
-            try:
-                last_num = int(row[0].replace('v', ''))
-                return f"v{last_num + 1}"
-            except:
-                return "v1"
+        if not row or not row[0]:
+            print(f"  📌 No previous version found -> v1")
+            return "v1"
         
-        return "v1"
+        last_version = row[0]
+        print(f"  📌 Last version: {last_version}")
+        
+        # ✅ FIX: Extract number correctly
+        match = re.match(r'v(\d+)', last_version)
+        
+        if match:
+            last_num = int(match.group(1))
+            next_version = f"v{last_num + 1}"
+            print(f"  ✅ Next version: {next_version}")
+            return next_version
+        else:
+            print(f"  ⚠️  Invalid format '{last_version}' -> defaulting to v1")
+            return "v1"
         
     except Exception as e:
-        print(f"  ⚠️  Version calc failed: {e}")
+        print(f"  ❌ Version calc failed: {e}")
+        import traceback
+        traceback.print_exc()
         return "v1"
 
 def fetch_interaction_memories(postgres_uri: str, user_id: str, last_trained_at=None, limit: int = 500):
@@ -283,6 +296,7 @@ try:
 
     if last_training:
         print(f"\n  ✅ Found previous training:")
+        print(f"     Job ID: {last_training.get('job_id', 'N/A')}")
         print(f"     Version: {last_training['adapter_version']}")
         print(f"     Completed: {last_training['completed_at']}")
         
@@ -291,11 +305,28 @@ try:
         )
         
         if previous_adapter_path:
-            print(f"     Adapter: {previous_adapter_path}")
+            print(f"     Adapter Path: {previous_adapter_path}")
             IS_INCREMENTAL = True
             LAST_TRAINED_AT = last_training['completed_at']
             PREVIOUS_VERSION = last_training['adapter_version']
+            
+            # ✅ ADD DEBUG
+            print(f"\n  🔍 Calculating next version...")
+            print(f"     Current (last): {PREVIOUS_VERSION}")
+            
             NEW_VERSION = get_next_version_number(POSTGRES_URI, USER_ID)
+            
+            print(f"     Calculated (next): {NEW_VERSION}")
+            
+            # ✅ VALIDATE
+            if NEW_VERSION == PREVIOUS_VERSION:
+                print(f"     ⚠️  WARNING: Version didn't increment!")
+                print(f"     Forcing increment...")
+                match = re.match(r'v(\d+)', PREVIOUS_VERSION)
+                if match:
+                    num = int(match.group(1))
+                    NEW_VERSION = f"v{num + 1}"
+                    print(f"     ✅ Forced to: {NEW_VERSION}")
         else:
             print(f"     ⚠️  Adapter files not found")
             IS_INCREMENTAL = False
@@ -311,14 +342,19 @@ try:
         PREVIOUS_VERSION = None
         NEW_VERSION = "v1"
 
+    # ✅ FINAL VALIDATION
     ADAPTER_VERSION = NEW_VERSION
     OUTPUT_DIR = os.path.join(OUTPUT_BASE, USER_ID, ADAPTER_VERSION)
     TRAINING_ID = f"train-{USER_ID[:8]}-{ADAPTER_VERSION}"
 
-    print(f"\n  📊 Configuration:")
+    print(f"\n  📊 Final Configuration:")
     print(f"     Mode: {'INCREMENTAL' if IS_INCREMENTAL else 'FULL'}")
+    print(f"     Previous Version: {PREVIOUS_VERSION or 'None'}")
     print(f"     New Version: {NEW_VERSION}")
+    print(f"     Adapter Version: {ADAPTER_VERSION}")
     print(f"     Training ID: {TRAINING_ID}")
+    print(f"     Output Dir: {OUTPUT_DIR}")
+    print("="*60)
 
     # Fetch data
     print("\n📋 STEP 5: Fetching training data...")
