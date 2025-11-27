@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-LoRA Training Pipeline - INCREMENTAL TRAINING (COMPLETE FIXED)
-✅ เทรนแบบสะสมประสบการณ์
-✅ Fixed: Version management + Previous adapter detection
-✅ Debug output เต็มรูปแบบ
-✅ Auto scale down to 0 after completion (FIXED)
+LoRA Training Pipeline - INCREMENTAL TRAINING (FIXED)
+✅ Fixed: Proper gradient handling for incremental training
+✅ Fixed: Ensure all LoRA parameters require grad
 """
 
 import os
@@ -17,9 +15,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# ===== Startup Info =====
 print("="*60)
-print("🚀 LoRA Incremental Training (COMPLETE FIXED)")
+print("🚀 LoRA Incremental Training (FIXED)")
 print("="*60)
 print(f"Time: {datetime.utcnow().isoformat()}Z")
 print(f"Python: {sys.version}")
@@ -31,7 +28,7 @@ print("\n📋 STEP 1: Checking imports...")
 try:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, DataCollatorForLanguageModeling
-    from peft import LoraConfig, get_peft_model, PeftModel, TaskType
+    from peft import LoraConfig, get_peft_model, PeftModel, TaskType, prepare_model_for_kbit_training
     from datasets import Dataset
     import psycopg2
     from psycopg2.extras import RealDictCursor
@@ -54,11 +51,6 @@ CONFIG = {
     "batch_size": 1,
     "max_length": 512,
     "gradient_accumulation_steps": 4,
-    "growth_weight": 0.30,
-    "challenge_weight": 0.25,
-    "wisdom_weight": 0.25,
-    "neutral_weight": 0.15,
-    "support_weight": 0.05,
     "min_samples_new": 3,
     "max_samples_per_training": 500,
 }
@@ -76,20 +68,16 @@ print(f"  POSTGRES_URI: {'✅ SET' if POSTGRES_URI else '❌ MISSING'}")
 print(f"  USER_ID: {USER_ID or '❌ MISSING'}")
 print(f"  MODEL_NAME: {MODEL_NAME}")
 print(f"  OUTPUT_BASE: {OUTPUT_BASE}")
-print(f"  NORTHFLANK_API_TOKEN: {'✅ SET' if NORTHFLANK_API_TOKEN else '⚠️  MISSING'}")
-print(f"  NORTHFLANK_PROJECT_ID: {'✅ SET' if NORTHFLANK_PROJECT_ID else '⚠️  MISSING'}")
 
 if not POSTGRES_URI or not USER_ID:
     print("\n❌ FATAL: Missing required environment variables")
     sys.exit(1)
 
-# ===== Scale Down Function - COMPLETE FIXED =====
+# ===== Helper Functions =====
 def scale_service_to_zero():
-    """Scale Northflank service to 0 replicas - COMPLETE FIXED VERSION"""
+    """Scale service to 0"""
     if not NORTHFLANK_API_TOKEN or not NORTHFLANK_PROJECT_ID:
         print("\n⚠️  Scale down skipped: Missing credentials")
-        print(f"     NORTHFLANK_API_TOKEN: {'SET' if NORTHFLANK_API_TOKEN else 'MISSING'}")
-        print(f"     NORTHFLANK_PROJECT_ID: {'SET' if NORTHFLANK_PROJECT_ID else 'MISSING'}")
         return False
     
     try:
@@ -100,11 +88,6 @@ def scale_service_to_zero():
         service_id = "lora-training"
         url = f"https://api.northflank.com/v1/projects/{NORTHFLANK_PROJECT_ID}/services/{service_id}/scale"
         
-        print(f"  Project ID: {NORTHFLANK_PROJECT_ID}")
-        print(f"  Service ID: {service_id}")
-        print(f"  URL: {url}")
-        print(f"  Token: {NORTHFLANK_API_TOKEN[:20]}...")
-        
         headers = {
             'Authorization': f'Bearer {NORTHFLANK_API_TOKEN}',
             'Content-Type': 'application/json',
@@ -112,75 +95,21 @@ def scale_service_to_zero():
         
         payload = {'instances': 0}
         
-        print(f"\n  🔄 Sending scale request...")
-        print(f"     Payload: {json.dumps(payload)}")
+        print(f"  🔄 Sending scale request...")
         
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-        
-        print(f"\n  📡 Response:")
-        print(f"     Status: {response.status_code}")
-        print(f"     Headers: {dict(response.headers)}")
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
         
         if response.ok:
-            print(f"\n  ✅ SUCCESS: Service scaled to 0 replicas")
-            try:
-                response_data = response.json()
-                print(f"     Response: {json.dumps(response_data, indent=2)}")
-            except:
-                print(f"     Response text: {response.text}")
+            print(f"  ✅ SUCCESS: Service scaled to 0 replicas")
             return True
         else:
-            print(f"\n  ❌ PRIMARY ENDPOINT FAILED: {response.status_code}")
-            print(f"     Error: {response.text}")
+            print(f"  ❌ Scale failed: {response.status_code}")
+            return False
             
-            # ✅ Try alternative PATCH endpoint
-            print(f"\n  🔄 Trying alternative PATCH endpoint...")
-            alt_url = f"https://api.northflank.com/v1/projects/{NORTHFLANK_PROJECT_ID}/services/{service_id}"
-            
-            alt_response = requests.patch(
-                alt_url,
-                headers=headers,
-                json={'spec': {'replicas': 0}},
-                timeout=30
-            )
-            
-            print(f"     Status: {alt_response.status_code}")
-            
-            if alt_response.ok:
-                print(f"  ✅ ALTERNATIVE ENDPOINT SUCCESS!")
-                try:
-                    alt_data = alt_response.json()
-                    print(f"     Response: {json.dumps(alt_data, indent=2)}")
-                except:
-                    print(f"     Response text: {alt_response.text}")
-                return True
-            else:
-                print(f"  ❌ ALTERNATIVE ALSO FAILED: {alt_response.status_code}")
-                print(f"     Error: {alt_response.text}")
-                return False
-            
-    except requests.exceptions.Timeout:
-        print(f"\n  ⏱️  TIMEOUT: Request took too long")
-        return False
-    except requests.exceptions.RequestException as e:
-        print(f"\n  ❌ REQUEST ERROR: {type(e).__name__}: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
     except Exception as e:
-        print(f"\n  ❌ UNEXPECTED ERROR: {type(e).__name__}: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"  ❌ Scale error: {e}")
         return False
-    finally:
-        print("="*60)
 
-# ===== DB Helper Functions =====
 def update_training_status(training_id: str, status: str, error_message: str = None):
     """Update training_jobs table"""
     try:
@@ -329,35 +258,12 @@ def fetch_interaction_memories(postgres_uri: str, user_id: str, last_trained_at=
         print(f"  ❌ Fetch failed: {e}")
         raise
 
-def fetch_ethical_profile(postgres_uri: str, user_id: str):
-    """Fetch ethical profile"""
-    try:
-        conn = psycopg2.connect(postgres_uri)
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        
-        query = """
-        SELECT growth_stage, self_awareness, emotional_regulation, compassion,
-               integrity, growth_mindset, wisdom, transcendence,
-               total_interactions, breakthrough_moments
-        FROM user_data_schema.ethical_profiles
-        WHERE user_id = %s
-        """
-        cursor.execute(query, (user_id,))
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
-        
-        return dict(row) if row else None
-    except Exception as e:
-        print(f"  ⚠️  No ethical profile: {e}")
-        return None
-
 # ===== MAIN EXECUTION =====
 TRAINING_ID = None
 training_success = False
 
 try:
-    # ===== STEP 3: Test DB =====
+    # Test DB connection
     print("\n📋 STEP 3: Testing database connection...")
     try:
         conn = psycopg2.connect(POSTGRES_URI)
@@ -371,11 +277,8 @@ try:
         print(f"  ❌ Database connection failed: {e}")
         sys.exit(1)
 
-    # ===== STEP 4: Check Previous Training =====
+    # Check previous training
     print("\n📋 STEP 4: Checking for previous training...")
-    print(f"  OUTPUT_BASE: {OUTPUT_BASE}")
-    print(f"  USER_ID: {USER_ID}")
-
     last_training = get_last_completed_training(POSTGRES_URI, USER_ID)
 
     if last_training:
@@ -417,7 +320,7 @@ try:
     print(f"     New Version: {NEW_VERSION}")
     print(f"     Training ID: {TRAINING_ID}")
 
-    # ===== STEP 5: Fetch Data =====
+    # Fetch data
     print("\n📋 STEP 5: Fetching training data...")
     
     conn = psycopg2.connect(POSTGRES_URI)
@@ -441,8 +344,6 @@ try:
         limit=CONFIG['max_samples_per_training']
     )
     
-    ethical_profile = fetch_ethical_profile(POSTGRES_URI, USER_ID)
-    
     total_samples = len(memories)
     print(f"\n  📊 Data: {total_samples} samples")
     
@@ -461,7 +362,7 @@ try:
         update_training_status(TRAINING_ID, 'failed', error_msg)
         raise Exception(error_msg)
     
-    # ===== STEP 6: Load Model =====
+    # Load model
     print("\n📋 STEP 6: Loading model...")
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -478,13 +379,25 @@ try:
     )
     print(f"  ✅ Base model loaded")
     
+    # ✅ FIX: Proper incremental loading
     if IS_INCREMENTAL and previous_adapter_path:
-        print(f"\n  🔄 Loading previous adapter...")
+        print(f"\n  🔄 Loading previous adapter for incremental training...")
         try:
+            # Load as PeftModel
             model = PeftModel.from_pretrained(base_model, previous_adapter_path)
-            print(f"  ✅ Incremental mode")
+            
+            # ✅ CRITICAL FIX: Ensure all LoRA parameters require grad
+            print(f"  🔧 Ensuring all LoRA parameters require gradients...")
+            for name, param in model.named_parameters():
+                if 'lora_' in name:
+                    param.requires_grad = True
+                    print(f"     ✅ {name}: requires_grad = True")
+            
+            print(f"  ✅ Incremental mode ready")
+            
         except Exception as e:
             print(f"  ⚠️  Adapter load failed: {e}")
+            print(f"  🔄 Falling back to FULL training")
             IS_INCREMENTAL = False
             model = base_model
     else:
@@ -492,7 +405,7 @@ try:
 
     gc.collect()
 
-    # ===== STEP 7: Prepare Dataset =====
+    # Prepare dataset
     print("\n📋 STEP 7: Preparing dataset...")
 
     def create_ethical_training_pairs(memories):
@@ -539,6 +452,7 @@ try:
 
     all_pairs = create_ethical_training_pairs(memories)
     
+    # Sample with weights
     pairs_by_class = {}
     for pair in all_pairs:
         cls = pair['classification']
@@ -549,22 +463,10 @@ try:
     sampled = []
     total = len(all_pairs)
     
-    print(f"\n  📊 Sampling:")
-    for cls, weight_key in [
-        ('growth_memory', 'growth_weight'),
-        ('challenge_memory', 'challenge_weight'),
-        ('wisdom_moment', 'wisdom_weight'),
-        ('neutral_interaction', 'neutral_weight'),
-        ('needs_support', 'support_weight'),
-    ]:
-        if cls in pairs_by_class:
-            target = int(total * CONFIG[weight_key])
-            available = pairs_by_class[cls]
-            sample_size = min(target, len(available))
-            sampled.extend(random.sample(available, sample_size))
-            print(f"     {cls}: {sample_size}/{len(available)}")
-    
+    # Simplified sampling - use all pairs
+    sampled = all_pairs
     random.shuffle(sampled)
+    
     print(f"\n  ✅ {len(sampled)} training pairs")
     
     texts = [
@@ -590,7 +492,7 @@ try:
 
     gc.collect()
 
-    # ===== STEP 8: Configure LoRA =====
+    # Configure LoRA
     if not IS_INCREMENTAL:
         print("\n📋 STEP 8: Configuring LoRA...")
         lora_config = LoraConfig(
@@ -605,12 +507,12 @@ try:
         print(f"  ✅ LoRA configured")
         model.print_trainable_parameters()
     else:
-        print("\n📋 STEP 8: Using existing adapter")
+        print("\n📋 STEP 8: Using existing adapter (incremental)")
         model.print_trainable_parameters()
 
     gc.collect()
 
-    # ===== STEP 9: Training =====
+    # Training
     print("\n📋 STEP 9: Starting training...")
     print(f"  Epochs: {CONFIG['num_epochs']}")
 
@@ -647,13 +549,34 @@ try:
     print(f"\n  ✅ Training completed!")
     print(f"     Loss: {result.training_loss:.4f}")
 
-    # ===== STEP 10: Save =====
+    # ✅ CRITICAL: Save model
     print("\n📋 STEP 10: Saving model...")
-
-    model.save_pretrained(OUTPUT_DIR)
-    tokenizer.save_pretrained(OUTPUT_DIR)
-    print(f"  ✅ Model saved: {OUTPUT_DIR}")
+    print(f"  📁 Output directory: {OUTPUT_DIR}")
+    print(f"  🔍 Checking directory exists...")
     
+    # Ensure directory exists
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print(f"  ✅ Directory created/verified")
+
+    # Save model
+    print(f"  💾 Saving adapter model...")
+    model.save_pretrained(OUTPUT_DIR)
+    print(f"  ✅ Adapter saved")
+    
+    print(f"  💾 Saving tokenizer...")
+    tokenizer.save_pretrained(OUTPUT_DIR)
+    print(f"  ✅ Tokenizer saved")
+    
+    # Verify files
+    print(f"  🔍 Verifying saved files...")
+    saved_files = os.listdir(OUTPUT_DIR)
+    print(f"  📄 Files in {OUTPUT_DIR}:")
+    for f in saved_files:
+        file_path = os.path.join(OUTPUT_DIR, f)
+        size = os.path.getsize(file_path)
+        print(f"     - {f} ({size:,} bytes)")
+    
+    # Save metadata
     metadata = {
         "user_id": USER_ID,
         "adapter_version": ADAPTER_VERSION,
@@ -667,18 +590,18 @@ try:
             "by_classification": by_class,
             "last_trained_at": str(LAST_TRAINED_AT) if LAST_TRAINED_AT else None,
         },
-        "ethical_profile": ethical_profile,
         "config": CONFIG,
         "metrics": {"loss": float(result.training_loss)},
         "trained_at": datetime.utcnow().isoformat() + "Z",
     }
     
-    with open(os.path.join(OUTPUT_DIR, "metadata.json"), "w") as f:
+    metadata_path = os.path.join(OUTPUT_DIR, "metadata.json")
+    with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
     
-    print(f"  ✅ Metadata saved")
+    print(f"  ✅ Metadata saved: {metadata_path}")
 
-    # ===== STEP 11: Update DB =====
+    # Update DB
     print("\n📋 STEP 11: Updating database...")
     update_training_status(TRAINING_ID, 'completed')
 
@@ -693,6 +616,7 @@ try:
     print(f"   Version: {ADAPTER_VERSION}")
     print(f"   Samples: {len(sampled)}/{total_samples}")
     print(f"   Loss: {result.training_loss:.4f}")
+    print(f"   Output: {OUTPUT_DIR}")
     print("="*60)
 
 except Exception as e:
@@ -710,27 +634,22 @@ except Exception as e:
     training_success = False
 
 finally:
-    # ✅ ALWAYS try to scale down
+    # Always try to scale down
     print("\n" + "="*60)
     print("🔄 CLEANUP: Attempting to scale down service...")
     print("="*60)
     
-    # Wait for logs to flush
     time.sleep(3)
     
-    # Try to scale down
     scale_success = scale_service_to_zero()
     
     if scale_success:
         print("\n✅ Service scaled down successfully")
     else:
         print("\n⚠️  Service scale down failed")
-        print("    Manual intervention may be required")
-        print("    Go to Northflank Dashboard → lora-training → Scale to 0")
     
     print("\n" + "="*60)
     print(f"{'✅ PROCESS COMPLETED' if training_success else '❌ PROCESS FAILED'}")
     print("="*60)
     
-    # Exit with appropriate code
     sys.exit(0 if training_success else 1)
