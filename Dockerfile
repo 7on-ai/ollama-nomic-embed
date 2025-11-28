@@ -1,5 +1,5 @@
 # ============================================
-# LoRA Training Service with FastAPI
+# LoRA Training Service with FastAPI + Ollama Integration
 # ============================================
 FROM pytorch/pytorch:2.2.0-cuda11.8-cudnn8-runtime
 
@@ -25,7 +25,8 @@ RUN pip install --no-cache-dir \
     scikit-learn==1.4.0 \
     fastapi==0.109.0 \
     uvicorn[standard]==0.27.0 \
-    pydantic==2.5.0
+    pydantic==2.5.0 \
+    requests==2.31.0
 
 # Pre-download model
 RUN python3 -c "from transformers import AutoModelForCausalLM, AutoTokenizer; \
@@ -41,9 +42,11 @@ RUN chmod +x /workspace/scripts/*.py
 ENV OUTPUT_PATH=/workspace/adapters
 ENV PYTHONUNBUFFERED=1
 ENV API_PORT=8000
+ENV OLLAMA_URL=http://ollama:11434
+ENV OLLAMA_ENABLED=true
 
 # Expose API port
 EXPOSE 8000
 
-# ✅ Start API server directly (no wrapper needed)
+# Start API server
 CMD ["python3", "-u", "/workspace/scripts/api_server.py"]

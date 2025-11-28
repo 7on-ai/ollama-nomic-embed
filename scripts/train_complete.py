@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-LoRA Training Pipeline - INCREMENTAL TRAINING (FIXED)
+LoRA Training Pipeline - COMPLETE WITH OLLAMA INTEGRATION
 ✅ Fixed: Proper gradient handling for incremental training
 ✅ Fixed: Ensure all LoRA parameters require grad
 ✅ Fixed: Version increment logic
+✅ NEW: Ollama Modelfile registration after training
 """
 
 import os
@@ -18,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 print("="*60)
-print("🚀 LoRA Incremental Training (FIXED)")
+print("🚀 LoRA Incremental Training + Ollama Integration")
 print("="*60)
 print(f"Time: {datetime.utcnow().isoformat()}Z")
 print(f"Python: {sys.version}")
@@ -66,10 +67,16 @@ OUTPUT_BASE = os.environ.get("OUTPUT_PATH", "/workspace/adapters")
 NORTHFLANK_API_TOKEN = os.environ.get("NORTHFLANK_API_TOKEN")
 NORTHFLANK_PROJECT_ID = os.environ.get("NORTHFLANK_PROJECT_ID")
 
+# ✅ NEW: Ollama configuration
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
+OLLAMA_ENABLED = os.environ.get("OLLAMA_ENABLED", "true").lower() == "true"
+
 print(f"  POSTGRES_URI: {'✅ SET' if POSTGRES_URI else '❌ MISSING'}")
 print(f"  USER_ID: {USER_ID or '❌ MISSING'}")
 print(f"  MODEL_NAME: {MODEL_NAME}")
 print(f"  OUTPUT_BASE: {OUTPUT_BASE}")
+print(f"  OLLAMA_URL: {OLLAMA_URL}")
+print(f"  OLLAMA_ENABLED: {OLLAMA_ENABLED}")
 
 if not POSTGRES_URI or not USER_ID:
     print("\n❌ FATAL: Missing required environment variables")
@@ -271,6 +278,172 @@ def fetch_interaction_memories(postgres_uri: str, user_id: str, last_trained_at=
         print(f"  ❌ Fetch failed: {e}")
         raise
 
+# ===== ✅ NEW: Ollama Integration Functions =====
+
+def check_ollama_health():
+    """Check if Ollama service is available"""
+    if not OLLAMA_ENABLED:
+        print("\n⚠️  Ollama integration disabled")
+        return False
+    
+    try:
+        print(f"\n🔍 Checking Ollama at {OLLAMA_URL}...")
+        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
+        
+        if response.ok:
+            print("  ✅ Ollama is online")
+            return True
+        else:
+            print(f"  ⚠️  Ollama returned status {response.status_code}")
+            return False
+            
+    except Exception as e:
+        print(f"  ⚠️  Ollama not reachable: {e}")
+        return False
+
+def register_adapter_with_ollama(adapter_path: str, user_id: str, version: str, base_model: str):
+    """
+    Register trained adapter with Ollama using Modelfile API
+    
+    Args:
+        adapter_path: Full path to adapter directory (e.g., /workspace/adapters/user123/v1)
+        user_id: User ID (first 8 chars used in model name)
+        version: Version (e.g., v1, v2)
+        base_model: Base model name (e.g., TinyLlama/TinyLlama-1.1B-Chat-v1.0)
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if not OLLAMA_ENABLED:
+        print("\n⚠️  Ollama registration skipped (disabled)")
+        return False
+    
+    try:
+        print("\n" + "="*60)
+        print("🤖 REGISTERING ADAPTER WITH OLLAMA")
+        print("="*60)
+        
+        # Validate adapter file exists
+        adapter_file = os.path.join(adapter_path, "adapter_model.safetensors")
+        if not os.path.exists(adapter_file):
+            print(f"  ❌ Adapter file not found: {adapter_file}")
+            return False
+        
+        print(f"  ✅ Adapter file found: {adapter_file}")
+        print(f"  📊 File size: {os.path.getsize(adapter_file):,} bytes")
+        
+        # Create model name (consistent with N8N)
+        model_name = f"ethical-{user_id[:8]}-{version}"
+        print(f"  📝 Model name: {model_name}")
+        
+        # Create Modelfile content
+        modelfile = f"""FROM {base_model}
+ADAPTER {adapter_file}
+PARAMETER temperature 0.7
+PARAMETER top_p 0.9
+PARAMETER num_ctx 2048
+"""
+        
+        print(f"  📄 Modelfile content:")
+        print("  " + "-"*56)
+        for line in modelfile.strip().split('\n'):
+            print(f"  {line}")
+        print("  " + "-"*56)
+        
+        # Call Ollama API
+        print(f"\n  🔄 Calling Ollama API: POST {OLLAMA_URL}/api/create")
+        
+        response = requests.post(
+            f"{OLLAMA_URL}/api/create",
+            json={
+                "name": model_name,
+                "modelfile": modelfile,
+            },
+            timeout=300  # 5 minutes for model creation
+        )
+        
+        if response.ok:
+            print(f"  ✅ SUCCESS: Model registered as '{model_name}'")
+            print(f"  🎯 N8N Ollama node can now use: {model_name}")
+            
+            # Verify registration
+            verify_response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
+            if verify_response.ok:
+                models = verify_response.json().get('models', [])
+                if any(m.get('name', '').startswith(model_name) for m in models):
+                    print(f"  ✅ Verified: Model appears in Ollama model list")
+                else:
+                    print(f"  ⚠️  Warning: Model not found in list (may need refresh)")
+            
+            return True
+        else:
+            error_text = response.text
+            print(f"  ❌ Ollama API error: {response.status_code}")
+            print(f"  📄 Response: {error_text}")
+            return False
+            
+    except requests.Timeout:
+        print(f"  ❌ Timeout: Model creation took too long")
+        return False
+    except Exception as e:
+        print(f"  ❌ Registration error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def cleanup_old_ollama_models(user_id: str, keep_versions: int = 3):
+    """
+    Optional: Remove old model versions from Ollama to save space
+    
+    Args:
+        user_id: User ID
+        keep_versions: Number of recent versions to keep
+    """
+    if not OLLAMA_ENABLED:
+        return
+    
+    try:
+        print(f"\n🧹 Cleaning up old Ollama models (keep {keep_versions} versions)...")
+        
+        # Get all models
+        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
+        if not response.ok:
+            return
+        
+        models = response.json().get('models', [])
+        
+        # Filter user's models
+        user_prefix = f"ethical-{user_id[:8]}-"
+        user_models = [m for m in models if m.get('name', '').startswith(user_prefix)]
+        
+        print(f"  📊 Found {len(user_models)} models for this user")
+        
+        if len(user_models) <= keep_versions:
+            print(f"  ✅ No cleanup needed")
+            return
+        
+        # Sort by name (assuming v1, v2, v3... format)
+        user_models.sort(key=lambda m: m.get('name', ''), reverse=True)
+        
+        # Delete old versions
+        for model in user_models[keep_versions:]:
+            model_name = model.get('name', '')
+            print(f"  🗑️  Deleting old model: {model_name}")
+            
+            delete_response = requests.delete(
+                f"{OLLAMA_URL}/api/delete",
+                json={"name": model_name},
+                timeout=30
+            )
+            
+            if delete_response.ok:
+                print(f"     ✅ Deleted")
+            else:
+                print(f"     ⚠️  Failed to delete")
+        
+    except Exception as e:
+        print(f"  ⚠️  Cleanup error: {e}")
+
 # ===== MAIN EXECUTION =====
 TRAINING_ID = None
 training_success = False
@@ -289,6 +462,9 @@ try:
     except Exception as e:
         print(f"  ❌ Database connection failed: {e}")
         sys.exit(1)
+
+    # ✅ NEW: Check Ollama health
+    ollama_available = check_ollama_health()
 
     # Check previous training
     print("\n📋 STEP 4: Checking for previous training...")
@@ -309,19 +485,11 @@ try:
             IS_INCREMENTAL = True
             LAST_TRAINED_AT = last_training['completed_at']
             PREVIOUS_VERSION = last_training['adapter_version']
-            
-            # ✅ ADD DEBUG
-            print(f"\n  🔍 Calculating next version...")
-            print(f"     Current (last): {PREVIOUS_VERSION}")
-            
             NEW_VERSION = get_next_version_number(POSTGRES_URI, USER_ID)
             
-            print(f"     Calculated (next): {NEW_VERSION}")
-            
-            # ✅ VALIDATE
+            # Validate version increment
             if NEW_VERSION == PREVIOUS_VERSION:
                 print(f"     ⚠️  WARNING: Version didn't increment!")
-                print(f"     Forcing increment...")
                 match = re.match(r'v(\d+)', PREVIOUS_VERSION)
                 if match:
                     num = int(match.group(1))
@@ -342,7 +510,7 @@ try:
         PREVIOUS_VERSION = None
         NEW_VERSION = "v1"
 
-    # ✅ FINAL VALIDATION
+    # Final configuration
     ADAPTER_VERSION = NEW_VERSION
     OUTPUT_DIR = os.path.join(OUTPUT_BASE, USER_ID, ADAPTER_VERSION)
     TRAINING_ID = f"train-{USER_ID[:8]}-{ADAPTER_VERSION}"
@@ -415,19 +583,17 @@ try:
     )
     print(f"  ✅ Base model loaded")
     
-    # ✅ FIX: Proper incremental loading
+    # Load previous adapter if incremental
     if IS_INCREMENTAL and previous_adapter_path:
         print(f"\n  🔄 Loading previous adapter for incremental training...")
         try:
-            # Load as PeftModel
             model = PeftModel.from_pretrained(base_model, previous_adapter_path)
             
-            # ✅ CRITICAL FIX: Ensure all LoRA parameters require grad
+            # Ensure all LoRA parameters require grad
             print(f"  🔧 Ensuring all LoRA parameters require gradients...")
             for name, param in model.named_parameters():
                 if 'lora_' in name:
                     param.requires_grad = True
-                    print(f"     ✅ {name}: requires_grad = True")
             
             print(f"  ✅ Incremental mode ready")
             
@@ -488,18 +654,7 @@ try:
 
     all_pairs = create_ethical_training_pairs(memories)
     
-    # Sample with weights
-    pairs_by_class = {}
-    for pair in all_pairs:
-        cls = pair['classification']
-        if cls not in pairs_by_class:
-            pairs_by_class[cls] = []
-        pairs_by_class[cls].append(pair)
-    
-    sampled = []
-    total = len(all_pairs)
-    
-    # Simplified sampling - use all pairs
+    # Use all pairs
     sampled = all_pairs
     random.shuffle(sampled)
     
@@ -585,16 +740,12 @@ try:
     print(f"\n  ✅ Training completed!")
     print(f"     Loss: {result.training_loss:.4f}")
 
-    # ✅ CRITICAL: Save model
+    # Save model
     print("\n📋 STEP 10: Saving model...")
     print(f"  📁 Output directory: {OUTPUT_DIR}")
-    print(f"  🔍 Checking directory exists...")
     
-    # Ensure directory exists
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print(f"  ✅ Directory created/verified")
-
-    # Save model
+    
     print(f"  💾 Saving adapter model...")
     model.save_pretrained(OUTPUT_DIR)
     print(f"  ✅ Adapter saved")
@@ -629,6 +780,7 @@ try:
         "config": CONFIG,
         "metrics": {"loss": float(result.training_loss)},
         "trained_at": datetime.utcnow().isoformat() + "Z",
+        "ollama_registered": False,  # Will be updated below
     }
     
     metadata_path = os.path.join(OUTPUT_DIR, "metadata.json")
@@ -637,8 +789,38 @@ try:
     
     print(f"  ✅ Metadata saved: {metadata_path}")
 
+    # ===== ✅ NEW: STEP 11 - Register with Ollama =====
+    print("\n📋 STEP 11: Registering with Ollama...")
+    
+    ollama_success = False
+    if ollama_available:
+        ollama_success = register_adapter_with_ollama(
+            adapter_path=OUTPUT_DIR,
+            user_id=USER_ID,
+            version=ADAPTER_VERSION,
+            base_model=MODEL_NAME
+        )
+        
+        if ollama_success:
+            # Update metadata
+            metadata["ollama_registered"] = True
+            metadata["ollama_model_name"] = f"ethical-{USER_ID[:8]}-{ADAPTER_VERSION}"
+            metadata["ollama_registered_at"] = datetime.utcnow().isoformat() + "Z"
+            
+            with open(metadata_path, "w") as f:
+                json.dump(metadata, f, indent=2)
+            
+            print(f"  ✅ Metadata updated with Ollama info")
+            
+            # Optional: Cleanup old models
+            cleanup_old_ollama_models(USER_ID, keep_versions=3)
+        else:
+            print(f"  ⚠️  Ollama registration failed (training still successful)")
+    else:
+        print(f"  ⚠️  Ollama not available (skipping registration)")
+
     # Update DB
-    print("\n📋 STEP 11: Updating database...")
+    print("\n📋 STEP 12: Updating database...")
     update_training_status(TRAINING_ID, 'completed')
 
     training_success = True
@@ -653,6 +835,9 @@ try:
     print(f"   Samples: {len(sampled)}/{total_samples}")
     print(f"   Loss: {result.training_loss:.4f}")
     print(f"   Output: {OUTPUT_DIR}")
+    print(f"   Ollama: {'✅ Registered' if ollama_success else '⚠️  Not registered'}")
+    if ollama_success:
+        print(f"   Model Name: ethical-{USER_ID[:8]}-{ADAPTER_VERSION}")
     print("="*60)
 
 except Exception as e:
@@ -689,3 +874,4 @@ finally:
     print("="*60)
     
     sys.exit(0 if training_success else 1)
+    
