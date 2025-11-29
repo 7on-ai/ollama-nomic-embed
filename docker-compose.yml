@@ -1,0 +1,330 @@
+version: '3.8'
+
+# =====================================================
+# Ethical Growth System - Production-Ready Docker Compose
+# =====================================================
+# Features:
+# ✅ Resource limits (production-safe)
+# ✅ pgvector extension (semantic search)
+# ✅ Auto-model pulling (first-run setup)
+# ✅ Health checks (all services)
+# ✅ Proper volume permissions
+# ✅ N8N workflow mounting
+# ✅ Timezone configuration
+# =====================================================
+
+# ===== Shared Volumes =====
+volumes:
+  adapters:
+    driver: local
+  postgres-data:
+    driver: local
+  ollama-data:
+    driver: local
+  n8n-data:
+    driver: local
+
+# ===== Network =====
+networks:
+  ethical-network:
+    driver: bridge
+
+# ===== Services =====
+services:
+  
+  # =====================================================
+  # PostgreSQL Database (with pgvector extension)
+  # =====================================================
+  postgres:
+    image: pgvector/pgvector:pg16  # ✅ Vector support for semantic search
+    container_name: ethical-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ethical_user
+      POSTGRES_PASSWORD: ethical_pass
+      POSTGRES_DB: ethical_db
+      # Performance tuning
+      POSTGRES_SHARED_BUFFERS: 256MB
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 1GB
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - ethical-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ethical_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 2G  # ✅ Prevent OOM
+          cpus: '2.0'
+        reservations:
+          memory: 512M
+
+  # =====================================================
+  # Ollama Service (LLM & Embeddings)
+  # =====================================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ethical-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+      - adapters:/workspace/adapters:ro  # ✅ Read-only for trained adapters
+    networks:
+      - ethical-network
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_KEEP_ALIVE=5m  # Keep models loaded
+      - OLLAMA_NUM_PARALLEL=2  # Concurrent requests
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s  # ✅ Allow time for startup
+    deploy:
+      resources:
+        limits:
+          memory: 4G  # ✅ Safe limit for Ollama
+          cpus: '4.0'
+        reservations:
+          memory: 2G
+    # Optional: GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # =====================================================
+  # Ollama Init (Auto-pull models on first run)
+  # =====================================================
+  ollama-init:
+    image: curlimages/curl:latest
+    container_name: ethical-ollama-init
+    restart: "no"  # ✅ Run once only
+    networks:
+      - ethical-network
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        echo '🔄 Pulling TinyLlama base model...' &&
+        curl -X POST http://ollama:11434/api/pull \
+          -H 'Content-Type: application/json' \
+          -d '{\"name\":\"tinyllama\"}' &&
+        echo '✅ TinyLlama pulled!' &&
+        echo '🔄 Pulling nomic-embed-text for embeddings...' &&
+        curl -X POST http://ollama:11434/api/pull \
+          -H 'Content-Type: application/json' \
+          -d '{\"name\":\"nomic-embed-text\"}' &&
+        echo '✅ nomic-embed-text pulled!' &&
+        echo '🎉 All models ready!'
+      "
+
+  # =====================================================
+  # LoRA Training Service
+  # =====================================================
+  lora-training:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ethical-lora-training
+    restart: unless-stopped
+    environment:
+      # API Configuration
+      - API_PORT=8000
+      - PYTHONUNBUFFERED=1
+      
+      # Model Configuration
+      - MODEL_NAME=TinyLlama/TinyLlama-1.1B-Chat-v1.0
+      - OUTPUT_PATH=/workspace/adapters
+      
+      # Ollama Integration (✅ NEW)
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_ENABLED=true
+      
+      # Database (will be passed per-request, but good to have default)
+      - POSTGRES_URI=postgresql://ethical_user:ethical_pass@postgres:5432/ethical_db
+    volumes:
+      - adapters:/workspace/adapters:rw  # ✅ Read-write for training
+    ports:
+      - "8000:8000"
+    networks:
+      - ethical-network
+    depends_on:
+      ollama:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully  # ✅ Wait for models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s  # Allow time for model loading
+    deploy:
+      resources:
+        limits:
+          memory: 8G  # ✅ Safe for training
+          cpus: '4.0'
+        reservations:
+          memory: 4G
+    # Optional: GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # =====================================================
+  # Gating Service (Ethical Classification)
+  # =====================================================
+  gating-service:
+    build:
+      context: ./gating-service
+      dockerfile: Dockerfile
+    container_name: ethical-gating
+    restart: unless-stopped
+    environment:
+      - OLLAMA_EXTERNAL_URL=http://ollama:11434
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "8080:8080"
+    networks:
+      - ethical-network
+    depends_on:
+      ollama:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 512M
+
+  # =====================================================
+  # N8N Workflow Automation
+  # =====================================================
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: ethical-n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      # Authentication
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=admin
+      
+      # Network Configuration
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://n8n:5678/
+      
+      # Localization
+      - GENERIC_TIMEZONE=Asia/Bangkok
+      - TZ=Asia/Bangkok
+      
+      # Database (optional - for persistence)
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=ethical_db
+      - DB_POSTGRESDB_USER=ethical_user
+      - DB_POSTGRESDB_PASSWORD=ethical_pass
+      
+      # Execution
+      - EXECUTIONS_DATA_SAVE_ON_ERROR=all
+      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
+      - EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS=true
+    volumes:
+      - n8n-data:/home/node/.n8n
+      - ./n8n-workflows:/home/node/.n8n/workflows:ro  # ✅ Pre-built workflows
+    networks:
+      - ethical-network
+    depends_on:
+      - postgres
+      - ollama
+      - gating-service
+      - lora-training
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 512M
+
+# =====================================================
+# Optional Services (uncomment to enable)
+# =====================================================
+
+  # # Redis (for N8N queue mode)
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: ethical-redis
+  #   restart: unless-stopped
+  #   networks:
+  #     - ethical-network
+  #   volumes:
+  #     - redis-data:/data
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 512M
+
+  # # Prometheus (monitoring)
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   container_name: ethical-prometheus
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #   networks:
+  #     - ethical-network
+
+  # # Grafana (visualization)
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   container_name: ethical-grafana
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - GF_SECURITY_ADMIN_PASSWORD=admin
+  #   networks:
+  #     - ethical-network
