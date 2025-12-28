@@ -337,7 +337,7 @@ def register_adapter_with_ollama(adapter_path: str, user_id: str, version: str, 
         print(f"  📝 Model name: {model_name}")
         
         # Create Modelfile content
-        modelfile = f"""FROM {base_model}
+        modelfile = f"""FROM tinyllama
 ADAPTER {adapter_file}
 PARAMETER temperature 0.7
 PARAMETER top_p 0.9
