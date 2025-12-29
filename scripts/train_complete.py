@@ -580,18 +580,79 @@ try:
         print("⚠️  Warning: Failed to save to Postgres")
     
     # ===== STEP 12: Ollama (optional, cloud only) =====
-    ollama_available = check_ollama_health()
-    ollama_success = False
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
+OLLAMA_ENABLED = os.environ.get("OLLAMA_ENABLED", "false").lower() == "true"
+
+if OLLAMA_ENABLED:
+    print("\n📋 STEP 12: Registering with Ollama...")
     
-    if ollama_available:
-        print("\n📋 STEP 12: Registering with Ollama (cloud)...")
-        ollama_success = register_adapter_with_ollama(OUTPUT_DIR, USER_ID, NEW_VERSION)
-        if ollama_success:
-            print("  ✅ Registered with cloud Ollama")
+    try:
+        # Create Modelfile
+        modelfile = f"""FROM tinyllama
+ADAPTER ./adapter_model.safetensors
+PARAMETER temperature 0.7
+PARAMETER top_p 0.9
+PARAMETER num_ctx 2048
+"""
+        
+        model_name = f"ethical-{USER_ID[:8]}-{NEW_VERSION}"
+        
+        print(f"  🤖 Model name: {model_name}")
+        print(f"  🔗 Ollama URL: {OLLAMA_URL}")
+        
+        # Get adapter from Postgres
+        conn = psycopg2.connect(POSTGRES_URI)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT data FROM user_data_schema.adapter_files
+            WHERE user_id = %s AND version = %s AND filename = 'adapter_model.safetensors'
+        """, (USER_ID, NEW_VERSION))
+        
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if not row:
+            print("  ⚠️  Adapter not found in Postgres")
         else:
-            print("  ⚠️  Cloud Ollama registration failed")
-    else:
-        print("\n📋 STEP 12: Ollama not available (skipped)")
+            adapter_data = bytes(row[0])
+            
+            # Save temporarily
+            temp_path = f"/tmp/adapter_{NEW_VERSION}.safetensors"
+            with open(temp_path, 'wb') as f:
+                f.write(adapter_data)
+            
+            # Create Modelfile with temp path
+            modelfile_content = f"""FROM tinyllama
+ADAPTER {temp_path}
+PARAMETER temperature 0.7
+PARAMETER top_p 0.9
+PARAMETER num_ctx 2048
+"""
+            
+            # Call Ollama API
+            response = requests.post(
+                f"{OLLAMA_URL}/api/create",
+                json={
+                    "name": model_name,
+                    "modelfile": modelfile_content,
+                },
+                timeout=300
+            )
+            
+            if response.ok:
+                print(f"  ✅ Registered: {model_name}")
+            else:
+                print(f"  ⚠️  Registration failed: {response.status_code}")
+            
+            # Cleanup
+            os.remove(temp_path)
+            
+    except Exception as e:
+        print(f"  ⚠️  Ollama registration error: {e}")
+else:
+    print("\n📋 STEP 12: Ollama registration disabled")
     
     # Update DB
     print("\n📋 Updating database...")
