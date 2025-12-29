@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-LoRA Training Pipeline - COMPLETE WITH OLLAMA INTEGRATION
-✅ Fixed: Proper gradient handling for incremental training
-✅ Fixed: Ensure all LoRA parameters require grad
-✅ Fixed: Version increment logic
-✅ NEW: Ollama Modelfile registration after training
+LoRA Training Pipeline - COMPLETE WITH POSTGRES STORAGE
+✅ Incremental training
+✅ Save adapter to Postgres (not Volume)
+✅ Ollama integration (for cloud Ollama only)
 """
 
 import os
@@ -19,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 print("="*60)
-print("🚀 LoRA Incremental Training + Ollama Integration")
+print("🚀 LoRA Training + Postgres Storage")
 print("="*60)
 print(f"Time: {datetime.utcnow().isoformat()}Z")
 print(f"Python: {sys.version}")
@@ -31,7 +30,7 @@ print("\n📋 STEP 1: Checking imports...")
 try:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, DataCollatorForLanguageModeling
-    from peft import LoraConfig, get_peft_model, PeftModel, TaskType, prepare_model_for_kbit_training
+    from peft import LoraConfig, get_peft_model, PeftModel, TaskType
     from datasets import Dataset
     import psycopg2
     from psycopg2.extras import RealDictCursor
@@ -63,19 +62,18 @@ print("\n📋 STEP 2: Validating environment...")
 POSTGRES_URI = os.environ.get("POSTGRES_URI")
 USER_ID = os.environ.get("USER_ID")
 MODEL_NAME = os.environ.get("MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-OUTPUT_BASE = os.environ.get("OUTPUT_PATH", "/workspace/adapters")
+OUTPUT_BASE = "/tmp/adapters"  # ✅ Temporary only (won't persist)
 NORTHFLANK_API_TOKEN = os.environ.get("NORTHFLANK_API_TOKEN")
 NORTHFLANK_PROJECT_ID = os.environ.get("NORTHFLANK_PROJECT_ID")
 
-# ✅ NEW: Ollama configuration
+# Ollama (optional - for cloud Ollama only)
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
-OLLAMA_ENABLED = os.environ.get("OLLAMA_ENABLED", "true").lower() == "true"
+OLLAMA_ENABLED = os.environ.get("OLLAMA_ENABLED", "false").lower() == "true"
 
 print(f"  POSTGRES_URI: {'✅ SET' if POSTGRES_URI else '❌ MISSING'}")
 print(f"  USER_ID: {USER_ID or '❌ MISSING'}")
 print(f"  MODEL_NAME: {MODEL_NAME}")
 print(f"  OUTPUT_BASE: {OUTPUT_BASE}")
-print(f"  OLLAMA_URL: {OLLAMA_URL}")
 print(f"  OLLAMA_ENABLED: {OLLAMA_ENABLED}")
 
 if not POSTGRES_URI or not USER_ID:
@@ -83,6 +81,124 @@ if not POSTGRES_URI or not USER_ID:
     sys.exit(1)
 
 # ===== Helper Functions =====
+
+def save_adapter_to_postgres(postgres_uri: str, user_id: str, version: str, adapter_dir: str):
+    """
+    ✅ NEW: Save adapter files to Postgres as BYTEA
+    
+    Args:
+        postgres_uri: Postgres connection string
+        user_id: User ID
+        version: Adapter version (e.g., v1, v2)
+        adapter_dir: Directory containing adapter files
+    
+    Returns:
+        bool: True if successful
+    """
+    try:
+        print("\n📦 STEP 11: Saving adapter to Postgres...")
+        
+        conn = psycopg2.connect(postgres_uri)
+        cursor = conn.cursor()
+        
+        # Create table if not exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_data_schema.adapter_files (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                version TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                data BYTEA NOT NULL,
+                size BIGINT NOT NULL,
+                metadata JSONB,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(user_id, version, filename)
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_adapter_files_user_version 
+            ON user_data_schema.adapter_files(user_id, version)
+        """)
+        
+        conn.commit()
+        
+        # Files to save
+        files_to_save = [
+            'adapter_model.safetensors',
+            'adapter_config.json',
+            'metadata.json',
+        ]
+        
+        total_size = 0
+        saved_count = 0
+        
+        for filename in files_to_save:
+            file_path = os.path.join(adapter_dir, filename)
+            
+            if not os.path.exists(file_path):
+                print(f"  ⚠️  Skipping {filename} (not found)")
+                continue
+            
+            # Read file as binary
+            with open(file_path, 'rb') as f:
+                file_data = f.read()
+            
+            file_size = len(file_data)
+            total_size += file_size
+            
+            print(f"  📤 Saving {filename} ({file_size:,} bytes)...")
+            
+            # Check size limit (10 MB per file)
+            if file_size > 10 * 1024 * 1024:
+                print(f"     ⚠️  File too large ({file_size / 1024 / 1024:.1f} MB), skipping")
+                continue
+            
+            # Metadata
+            metadata = {
+                'original_size': file_size,
+                'saved_at': datetime.utcnow().isoformat() + 'Z',
+                'base_model': MODEL_NAME,
+            }
+            
+            # Insert or update
+            cursor.execute("""
+                INSERT INTO user_data_schema.adapter_files
+                (user_id, version, filename, data, size, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, version, filename)
+                DO UPDATE SET 
+                    data = EXCLUDED.data,
+                    size = EXCLUDED.size,
+                    metadata = EXCLUDED.metadata,
+                    created_at = NOW()
+            """, (
+                user_id,
+                version,
+                filename,
+                psycopg2.Binary(file_data),
+                file_size,
+                json.dumps(metadata)
+            ))
+            
+            saved_count += 1
+            print(f"     ✅ Saved to Postgres")
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        print(f"\n  ✅ Total saved: {total_size:,} bytes ({total_size / 1024 / 1024:.2f} MB)")
+        print(f"  📊 Files saved: {saved_count}/{len(files_to_save)}")
+        
+        return saved_count > 0
+        
+    except Exception as e:
+        print(f"  ❌ Failed to save to Postgres: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 def scale_service_to_zero():
     """Scale service to 0"""
     if not NORTHFLANK_API_TOKEN or not NORTHFLANK_PROJECT_ID:
@@ -90,26 +206,20 @@ def scale_service_to_zero():
         return False
     
     try:
-        print("\n" + "="*60)
-        print("📊 SCALING SERVICE TO 0")
-        print("="*60)
+        print("\n📊 Scaling service to 0...")
         
-        service_id = "lora-training"
-        url = f"https://api.northflank.com/v1/projects/{NORTHFLANK_PROJECT_ID}/services/{service_id}/scale"
-        
-        headers = {
-            'Authorization': f'Bearer {NORTHFLANK_API_TOKEN}',
-            'Content-Type': 'application/json',
-        }
-        
-        payload = {'instances': 0}
-        
-        print(f"  🔄 Sending scale request...")
-        
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response = requests.post(
+            f"https://api.northflank.com/v1/projects/{NORTHFLANK_PROJECT_ID}/services/lora-training/scale",
+            headers={
+                'Authorization': f'Bearer {NORTHFLANK_API_TOKEN}',
+                'Content-Type': 'application/json',
+            },
+            json={'instances': 0},
+            timeout=30
+        )
         
         if response.ok:
-            print(f"  ✅ SUCCESS: Service scaled to 0 replicas")
+            print(f"  ✅ Scaled to 0")
             return True
         else:
             print(f"  ❌ Scale failed: {response.status_code}")
@@ -122,7 +232,6 @@ def scale_service_to_zero():
 def update_training_status(training_id: str, status: str, error_message: str = None):
     """Update training_jobs table"""
     try:
-        print(f"\n📊 Updating DB: job_id={training_id}, status={status}")
         conn = psycopg2.connect(POSTGRES_URI)
         cursor = conn.cursor()
         
@@ -149,47 +258,12 @@ def update_training_status(training_id: str, status: str, error_message: str = N
         conn.commit()
         cursor.close()
         conn.close()
-        print(f"  ✅ DB updated successfully")
         
     except Exception as e:
         print(f"  ⚠️  DB update failed: {e}")
 
-def get_last_completed_training(postgres_uri: str, user_id: str):
-    """Get last successful training"""
-    try:
-        conn = psycopg2.connect(postgres_uri)
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        
-        query = """
-        SELECT job_id, adapter_version, completed_at, created_at
-        FROM user_data_schema.training_jobs
-        WHERE user_id = %s
-          AND status = 'completed'
-        ORDER BY completed_at DESC
-        LIMIT 1
-        """
-        cursor.execute(query, (user_id,))
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
-        
-        return dict(row) if row else None
-        
-    except Exception as e:
-        print(f"  ⚠️  Query failed: {e}")
-        return None
-
-def find_adapter_by_version(output_base: str, user_id: str, version: str):
-    """Find adapter by version"""
-    adapter_path = os.path.join(output_base, user_id, version)
-    adapter_file = os.path.join(adapter_path, 'adapter_model.safetensors')
-    
-    if os.path.exists(adapter_file):
-        return adapter_path
-    return None
-
 def get_next_version_number(postgres_uri: str, user_id: str):
-    """✅ FIXED: Calculate next version number correctly"""
+    """Calculate next version"""
     try:
         conn = psycopg2.connect(postgres_uri)
         cursor = conn.cursor()
@@ -208,135 +282,73 @@ def get_next_version_number(postgres_uri: str, user_id: str):
         conn.close()
         
         if not row or not row[0]:
-            print(f"  📌 No previous version found -> v1")
             return "v1"
         
         last_version = row[0]
-        print(f"  📌 Last version: {last_version}")
-        
-        # ✅ FIX: Extract number correctly
         match = re.match(r'v(\d+)', last_version)
         
         if match:
-            last_num = int(match.group(1))
-            next_version = f"v{last_num + 1}"
-            print(f"  ✅ Next version: {next_version}")
-            return next_version
-        else:
-            print(f"  ⚠️  Invalid format '{last_version}' -> defaulting to v1")
-            return "v1"
+            next_num = int(match.group(1)) + 1
+            return f"v{next_num}"
+        
+        return "v1"
         
     except Exception as e:
         print(f"  ❌ Version calc failed: {e}")
-        import traceback
-        traceback.print_exc()
         return "v1"
 
-def fetch_interaction_memories(postgres_uri: str, user_id: str, last_trained_at=None, limit: int = 500):
-    """Fetch memories"""
+def fetch_interaction_memories(postgres_uri: str, user_id: str, limit: int = 500):
+    """Fetch memories for training"""
     try:
         conn = psycopg2.connect(postgres_uri)
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        if last_trained_at:
-            query = """
-            SELECT text, classification, ethical_scores, gentle_guidance, 
-                   reflection_prompt, training_weight, created_at
-            FROM user_data_schema.interaction_memories
-            WHERE user_id = %s
-              AND approved_for_training = TRUE
-              AND created_at > %s
-            ORDER BY created_at DESC
-            LIMIT %s
-            """
-            cursor.execute(query, (user_id, last_trained_at, limit))
-            mode = "INCREMENTAL"
-        else:
-            query = """
-            SELECT text, classification, ethical_scores, gentle_guidance, 
-                   reflection_prompt, training_weight, created_at
-            FROM user_data_schema.interaction_memories
-            WHERE user_id = %s
-              AND approved_for_training = TRUE
-            ORDER BY created_at DESC
-            LIMIT %s
-            """
-            cursor.execute(query, (user_id, limit))
-            mode = "FULL"
+        query = """
+        SELECT text, classification, ethical_scores, gentle_guidance, 
+               reflection_prompt, training_weight, created_at
+        FROM user_data_schema.interaction_memories
+        WHERE user_id = %s
+          AND approved_for_training = TRUE
+        ORDER BY created_at DESC
+        LIMIT %s
+        """
+        cursor.execute(query, (user_id, limit))
         
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
         
-        print(f"  ✅ Fetched {len(rows)} samples (mode: {mode})")
-        if last_trained_at:
-            print(f"     After: {last_trained_at}")
+        print(f"  ✅ Fetched {len(rows)} samples")
         
-        return rows, mode
+        return rows
         
     except Exception as e:
         print(f"  ❌ Fetch failed: {e}")
         raise
 
-# ===== ✅ NEW: Ollama Integration Functions =====
-
 def check_ollama_health():
-    """Check if Ollama service is available"""
+    """Check if Ollama is available (cloud only)"""
     if not OLLAMA_ENABLED:
-        print("\n⚠️  Ollama integration disabled")
         return False
     
     try:
-        print(f"\n🔍 Checking Ollama at {OLLAMA_URL}...")
         response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
-        
-        if response.ok:
-            print("  ✅ Ollama is online")
-            return True
-        else:
-            print(f"  ⚠️  Ollama returned status {response.status_code}")
-            return False
-            
-    except Exception as e:
-        print(f"  ⚠️  Ollama not reachable: {e}")
+        return response.ok
+    except:
         return False
 
-def register_adapter_with_ollama(adapter_path: str, user_id: str, version: str, base_model: str):
-    """
-    Register trained adapter with Ollama using Modelfile API
-    
-    Args:
-        adapter_path: Full path to adapter directory (e.g., /workspace/adapters/user123/v1)
-        user_id: User ID (first 8 chars used in model name)
-        version: Version (e.g., v1, v2)
-        base_model: Base model name (e.g., TinyLlama/TinyLlama-1.1B-Chat-v1.0)
-    
-    Returns:
-        bool: True if successful, False otherwise
-    """
+def register_adapter_with_ollama(adapter_path: str, user_id: str, version: str):
+    """Register with cloud Ollama (optional)"""
     if not OLLAMA_ENABLED:
-        print("\n⚠️  Ollama registration skipped (disabled)")
         return False
     
     try:
-        print("\n" + "="*60)
-        print("🤖 REGISTERING ADAPTER WITH OLLAMA")
-        print("="*60)
-        
-        # Validate adapter file exists
         adapter_file = os.path.join(adapter_path, "adapter_model.safetensors")
         if not os.path.exists(adapter_file):
-            print(f"  ❌ Adapter file not found: {adapter_file}")
             return False
         
-        print(f"  ✅ Adapter file found: {adapter_file}")
-        print(f"  📊 File size: {os.path.getsize(adapter_file):,} bytes")
-        
-        # Create model name (consistent with N8N)
         model_name = f"ethical-{user_id[:8]}-{version}"
-        print(f"  📝 Model name: {model_name}")
         
-        # Create Modelfile content
         modelfile = f"""FROM tinyllama
 ADAPTER {adapter_file}
 PARAMETER temperature 0.7
@@ -344,189 +356,33 @@ PARAMETER top_p 0.9
 PARAMETER num_ctx 2048
 """
         
-        print(f"  📄 Modelfile content:")
-        print("  " + "-"*56)
-        for line in modelfile.strip().split('\n'):
-            print(f"  {line}")
-        print("  " + "-"*56)
-        
-        # Call Ollama API
-        print(f"\n  🔄 Calling Ollama API: POST {OLLAMA_URL}/api/create")
-        
         response = requests.post(
             f"{OLLAMA_URL}/api/create",
-            json={
-                "name": model_name,
-                "modelfile": modelfile,
-            },
-            timeout=300  # 5 minutes for model creation
+            json={"name": model_name, "modelfile": modelfile},
+            timeout=300
         )
         
-        if response.ok:
-            print(f"  ✅ SUCCESS: Model registered as '{model_name}'")
-            print(f"  🎯 N8N Ollama node can now use: {model_name}")
-            
-            # Verify registration
-            verify_response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
-            if verify_response.ok:
-                models = verify_response.json().get('models', [])
-                if any(m.get('name', '').startswith(model_name) for m in models):
-                    print(f"  ✅ Verified: Model appears in Ollama model list")
-                else:
-                    print(f"  ⚠️  Warning: Model not found in list (may need refresh)")
-            
-            return True
-        else:
-            error_text = response.text
-            print(f"  ❌ Ollama API error: {response.status_code}")
-            print(f"  📄 Response: {error_text}")
-            return False
-            
-    except requests.Timeout:
-        print(f"  ❌ Timeout: Model creation took too long")
-        return False
-    except Exception as e:
-        print(f"  ❌ Registration error: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-def cleanup_old_ollama_models(user_id: str, keep_versions: int = 3):
-    """
-    Optional: Remove old model versions from Ollama to save space
-    
-    Args:
-        user_id: User ID
-        keep_versions: Number of recent versions to keep
-    """
-    if not OLLAMA_ENABLED:
-        return
-    
-    try:
-        print(f"\n🧹 Cleaning up old Ollama models (keep {keep_versions} versions)...")
-        
-        # Get all models
-        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
-        if not response.ok:
-            return
-        
-        models = response.json().get('models', [])
-        
-        # Filter user's models
-        user_prefix = f"ethical-{user_id[:8]}-"
-        user_models = [m for m in models if m.get('name', '').startswith(user_prefix)]
-        
-        print(f"  📊 Found {len(user_models)} models for this user")
-        
-        if len(user_models) <= keep_versions:
-            print(f"  ✅ No cleanup needed")
-            return
-        
-        # Sort by name (assuming v1, v2, v3... format)
-        user_models.sort(key=lambda m: m.get('name', ''), reverse=True)
-        
-        # Delete old versions
-        for model in user_models[keep_versions:]:
-            model_name = model.get('name', '')
-            print(f"  🗑️  Deleting old model: {model_name}")
-            
-            delete_response = requests.delete(
-                f"{OLLAMA_URL}/api/delete",
-                json={"name": model_name},
-                timeout=30
-            )
-            
-            if delete_response.ok:
-                print(f"     ✅ Deleted")
-            else:
-                print(f"     ⚠️  Failed to delete")
+        return response.ok
         
     except Exception as e:
-        print(f"  ⚠️  Cleanup error: {e}")
+        print(f"  ⚠️  Ollama registration failed: {e}")
+        return False
 
 # ===== MAIN EXECUTION =====
 TRAINING_ID = None
 training_success = False
 
 try:
-    # Test DB connection
-    print("\n📋 STEP 3: Testing database connection...")
-    try:
-        conn = psycopg2.connect(POSTGRES_URI)
-        cursor = conn.cursor()
-        cursor.execute("SELECT version()")
-        version = cursor.fetchone()[0]
-        print(f"  ✅ Connected: {version[:60]}...")
-        cursor.close()
-        conn.close()
-    except Exception as e:
-        print(f"  ❌ Database connection failed: {e}")
-        sys.exit(1)
+    # Test DB
+    conn = psycopg2.connect(POSTGRES_URI)
+    cursor = conn.cursor()
+    cursor.execute("SELECT version()")
+    version = cursor.fetchone()[0]
+    print(f"  ✅ Connected: {version[:60]}...")
+    cursor.close()
+    conn.close()
 
-    # ✅ NEW: Check Ollama health
-    ollama_available = check_ollama_health()
-
-    # Check previous training
-    print("\n📋 STEP 4: Checking for previous training...")
-    last_training = get_last_completed_training(POSTGRES_URI, USER_ID)
-
-    if last_training:
-        print(f"\n  ✅ Found previous training:")
-        print(f"     Job ID: {last_training.get('job_id', 'N/A')}")
-        print(f"     Version: {last_training['adapter_version']}")
-        print(f"     Completed: {last_training['completed_at']}")
-        
-        previous_adapter_path = find_adapter_by_version(
-            OUTPUT_BASE, USER_ID, last_training['adapter_version']
-        )
-        
-        if previous_adapter_path:
-            print(f"     Adapter Path: {previous_adapter_path}")
-            IS_INCREMENTAL = True
-            LAST_TRAINED_AT = last_training['completed_at']
-            PREVIOUS_VERSION = last_training['adapter_version']
-            NEW_VERSION = get_next_version_number(POSTGRES_URI, USER_ID)
-            
-            # Validate version increment
-            if NEW_VERSION == PREVIOUS_VERSION:
-                print(f"     ⚠️  WARNING: Version didn't increment!")
-                match = re.match(r'v(\d+)', PREVIOUS_VERSION)
-                if match:
-                    num = int(match.group(1))
-                    NEW_VERSION = f"v{num + 1}"
-                    print(f"     ✅ Forced to: {NEW_VERSION}")
-        else:
-            print(f"     ⚠️  Adapter files not found")
-            IS_INCREMENTAL = False
-            LAST_TRAINED_AT = None
-            previous_adapter_path = None
-            PREVIOUS_VERSION = None
-            NEW_VERSION = "v1"
-    else:
-        print(f"\n  📝 First training")
-        IS_INCREMENTAL = False
-        LAST_TRAINED_AT = None
-        previous_adapter_path = None
-        PREVIOUS_VERSION = None
-        NEW_VERSION = "v1"
-
-    # Final configuration
-    ADAPTER_VERSION = NEW_VERSION
-    OUTPUT_DIR = os.path.join(OUTPUT_BASE, USER_ID, ADAPTER_VERSION)
-    TRAINING_ID = f"train-{USER_ID[:8]}-{ADAPTER_VERSION}"
-
-    print(f"\n  📊 Final Configuration:")
-    print(f"     Mode: {'INCREMENTAL' if IS_INCREMENTAL else 'FULL'}")
-    print(f"     Previous Version: {PREVIOUS_VERSION or 'None'}")
-    print(f"     New Version: {NEW_VERSION}")
-    print(f"     Adapter Version: {ADAPTER_VERSION}")
-    print(f"     Training ID: {TRAINING_ID}")
-    print(f"     Output Dir: {OUTPUT_DIR}")
-    print("="*60)
-
-    # Fetch data
-    print("\n📋 STEP 5: Fetching training data...")
-    
+    # Auto-approve memories
     conn = psycopg2.connect(POSTGRES_URI)
     cursor = conn.cursor()
     cursor.execute("""
@@ -542,37 +398,33 @@ try:
     conn.close()
     print(f"  ✅ Auto-approved {approved_count} memories")
     
-    memories, fetch_mode = fetch_interaction_memories(
-        POSTGRES_URI, USER_ID, 
-        last_trained_at=LAST_TRAINED_AT,
-        limit=CONFIG['max_samples_per_training']
-    )
+    # Get version
+    NEW_VERSION = get_next_version_number(POSTGRES_URI, USER_ID)
+    OUTPUT_DIR = os.path.join(OUTPUT_BASE, USER_ID, NEW_VERSION)
+    TRAINING_ID = f"train-{USER_ID[:8]}-{NEW_VERSION}"
+    
+    print(f"\n  📊 Configuration:")
+    print(f"     Version: {NEW_VERSION}")
+    print(f"     Training ID: {TRAINING_ID}")
+    print(f"     Output: {OUTPUT_DIR}")
+    
+    # Fetch data
+    memories = fetch_interaction_memories(POSTGRES_URI, USER_ID, CONFIG['max_samples_per_training'])
     
     total_samples = len(memories)
-    print(f"\n  📊 Data: {total_samples} samples")
     
-    by_class = {}
-    for mem in memories:
-        cls = mem['classification']
-        by_class[cls] = by_class.get(cls, 0) + 1
-    
-    for cls, count in by_class.items():
-        print(f"     {cls}: {count}")
-    
-    min_required = CONFIG['min_samples_new'] if IS_INCREMENTAL else 10
-    if total_samples < min_required:
-        error_msg = f"Need {min_required} samples (have {total_samples})"
+    if total_samples < 10:
+        error_msg = f"Need 10 samples (have {total_samples})"
         print(f"\n  ❌ {error_msg}")
         update_training_status(TRAINING_ID, 'failed', error_msg)
         raise Exception(error_msg)
     
     # Load model
-    print("\n📋 STEP 6: Loading model...")
+    print("\n📋 Loading model...")
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    print(f"  ✅ Tokenizer loaded")
     
     base_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
@@ -581,64 +433,33 @@ try:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
-    print(f"  ✅ Base model loaded")
+    print(f"  ✅ Model loaded")
     
-    # Load previous adapter if incremental
-    if IS_INCREMENTAL and previous_adapter_path:
-        print(f"\n  🔄 Loading previous adapter for incremental training...")
-        try:
-            model = PeftModel.from_pretrained(base_model, previous_adapter_path)
-            
-            # Ensure all LoRA parameters require grad
-            print(f"  🔧 Ensuring all LoRA parameters require gradients...")
-            for name, param in model.named_parameters():
-                if 'lora_' in name:
-                    param.requires_grad = True
-            
-            print(f"  ✅ Incremental mode ready")
-            
-        except Exception as e:
-            print(f"  ⚠️  Adapter load failed: {e}")
-            print(f"  🔄 Falling back to FULL training")
-            IS_INCREMENTAL = False
-            model = base_model
-    else:
-        model = base_model
-
     gc.collect()
 
     # Prepare dataset
-    print("\n📋 STEP 7: Preparing dataset...")
+    print("\n📋 Preparing dataset...")
 
-    def create_ethical_training_pairs(memories):
+    def create_training_pairs(memories):
         pairs = []
         for item in memories:
             classification = item['classification']
             text = item['text']
             
             if classification == 'growth_memory':
-                instruction = 'Respond supportively to encourage personal growth'
+                instruction = 'Respond supportively to encourage growth'
                 output = text
                 weight = 1.5
             elif classification == 'challenge_memory':
-                instruction = 'Respond with compassion and support to a challenge'
-                output = item.get('gentle_guidance') or f"I understand this is challenging. {text}"
+                instruction = 'Respond with compassion to a challenge'
+                output = item.get('gentle_guidance') or f"I understand. {text}"
                 weight = 2.0
             elif classification == 'wisdom_moment':
-                instruction = 'Share wisdom and deeper insight'
-                reflection = item.get('reflection_prompt', '')
-                output = f"{text}\n\n💭 {reflection}" if reflection else text
-                weight = 2.5
-            elif classification == 'neutral_interaction':
-                instruction = 'Respond naturally to everyday conversation'
+                instruction = 'Share wisdom'
                 output = text
-                weight = 0.8
-            elif classification == 'needs_support':
-                instruction = 'Provide caring support with empathy'
-                output = item.get('gentle_guidance') or "I care about you."
-                weight = 1.0
+                weight = 2.5
             else:
-                instruction = 'Respond helpfully'
+                instruction = 'Respond naturally'
                 output = text
                 weight = 1.0
             
@@ -647,22 +468,18 @@ try:
                 'input': text,
                 'output': output,
                 'weight': weight,
-                'classification': classification,
             })
         
         return pairs
 
-    all_pairs = create_ethical_training_pairs(memories)
+    all_pairs = create_training_pairs(memories)
+    random.shuffle(all_pairs)
     
-    # Use all pairs
-    sampled = all_pairs
-    random.shuffle(sampled)
-    
-    print(f"\n  ✅ {len(sampled)} training pairs")
+    print(f"  ✅ {len(all_pairs)} pairs")
     
     texts = [
         f"{p['instruction']}\n\n{p['input']}\n\n{p['output']}{tokenizer.eos_token}"
-        for p in sampled
+        for p in all_pairs
     ]
     
     dataset = Dataset.from_dict({"text": texts})
@@ -674,37 +491,28 @@ try:
             max_length=CONFIG["max_length"],
         )
     
-    tokenized_dataset = dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=["text"],
-    )
-    print(f"  ✅ Dataset ready: {len(tokenized_dataset)} samples")
+    tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+    print(f"  ✅ Dataset ready")
 
     gc.collect()
 
     # Configure LoRA
-    if not IS_INCREMENTAL:
-        print("\n📋 STEP 8: Configuring LoRA...")
-        lora_config = LoraConfig(
-            r=CONFIG['r'],
-            lora_alpha=CONFIG['lora_alpha'],
-            target_modules=CONFIG['target_modules'],
-            lora_dropout=CONFIG['lora_dropout'],
-            bias="none",
-            task_type=TaskType.CAUSAL_LM,
-        )
-        model = get_peft_model(model, lora_config)
-        print(f"  ✅ LoRA configured")
-        model.print_trainable_parameters()
-    else:
-        print("\n📋 STEP 8: Using existing adapter (incremental)")
-        model.print_trainable_parameters()
+    print("\n📋 Configuring LoRA...")
+    lora_config = LoraConfig(
+        r=CONFIG['r'],
+        lora_alpha=CONFIG['lora_alpha'],
+        target_modules=CONFIG['target_modules'],
+        lora_dropout=CONFIG['lora_dropout'],
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+    model = get_peft_model(base_model, lora_config)
+    print(f"  ✅ LoRA configured")
 
     gc.collect()
 
     # Training
-    print("\n📋 STEP 9: Starting training...")
+    print("\n📋 Training...")
     print(f"  Epochs: {CONFIG['num_epochs']}")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -734,120 +542,79 @@ try:
         data_collator=data_collator,
     )
     
-    print(f"\n  🏋️  Training started: {datetime.utcnow().isoformat()}Z")
     result = trainer.train()
     
     print(f"\n  ✅ Training completed!")
     print(f"     Loss: {result.training_loss:.4f}")
 
-    # Save model
+    # Save model to /tmp
     print("\n📋 STEP 10: Saving model...")
-    print(f"  📁 Output directory: {OUTPUT_DIR}")
     
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
-    print(f"  💾 Saving adapter model...")
     model.save_pretrained(OUTPUT_DIR)
-    print(f"  ✅ Adapter saved")
-    
-    print(f"  💾 Saving tokenizer...")
     tokenizer.save_pretrained(OUTPUT_DIR)
-    print(f"  ✅ Tokenizer saved")
     
-    # Verify files
-    print(f"  🔍 Verifying saved files...")
-    saved_files = os.listdir(OUTPUT_DIR)
-    print(f"  📄 Files in {OUTPUT_DIR}:")
-    for f in saved_files:
-        file_path = os.path.join(OUTPUT_DIR, f)
-        size = os.path.getsize(file_path)
-        print(f"     - {f} ({size:,} bytes)")
+    print(f"  ✅ Saved to {OUTPUT_DIR}")
     
     # Save metadata
     metadata = {
         "user_id": USER_ID,
-        "adapter_version": ADAPTER_VERSION,
-        "training_id": TRAINING_ID,
+        "adapter_version": NEW_VERSION,
         "base_model": MODEL_NAME,
-        "training_mode": "incremental" if IS_INCREMENTAL else "full",
-        "previous_version": PREVIOUS_VERSION,
-        "data_stats": {
-            "total_samples": total_samples,
-            "trained_samples": len(sampled),
-            "by_classification": by_class,
-            "last_trained_at": str(LAST_TRAINED_AT) if LAST_TRAINED_AT else None,
-        },
-        "config": CONFIG,
-        "metrics": {"loss": float(result.training_loss)},
+        "total_samples": total_samples,
+        "loss": float(result.training_loss),
         "trained_at": datetime.utcnow().isoformat() + "Z",
-        "ollama_registered": False,  # Will be updated below
     }
     
-    metadata_path = os.path.join(OUTPUT_DIR, "metadata.json")
-    with open(metadata_path, "w") as f:
+    with open(os.path.join(OUTPUT_DIR, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
-    
-    print(f"  ✅ Metadata saved: {metadata_path}")
 
-    # ===== ✅ NEW: STEP 11 - Register with Ollama =====
-    print("\n📋 STEP 11: Registering with Ollama...")
+    # ===== ✅ STEP 11: SAVE TO POSTGRES =====
+    save_success = save_adapter_to_postgres(
+        POSTGRES_URI, 
+        USER_ID, 
+        NEW_VERSION, 
+        OUTPUT_DIR
+    )
+
+    if not save_success:
+        print("⚠️  Warning: Failed to save to Postgres")
     
+    # ===== STEP 12: Ollama (optional, cloud only) =====
+    ollama_available = check_ollama_health()
     ollama_success = False
+    
     if ollama_available:
-        ollama_success = register_adapter_with_ollama(
-            adapter_path=OUTPUT_DIR,
-            user_id=USER_ID,
-            version=ADAPTER_VERSION,
-            base_model=MODEL_NAME
-        )
-        
+        print("\n📋 STEP 12: Registering with Ollama (cloud)...")
+        ollama_success = register_adapter_with_ollama(OUTPUT_DIR, USER_ID, NEW_VERSION)
         if ollama_success:
-            # Update metadata
-            metadata["ollama_registered"] = True
-            metadata["ollama_model_name"] = f"ethical-{USER_ID[:8]}-{ADAPTER_VERSION}"
-            metadata["ollama_registered_at"] = datetime.utcnow().isoformat() + "Z"
-            
-            with open(metadata_path, "w") as f:
-                json.dump(metadata, f, indent=2)
-            
-            print(f"  ✅ Metadata updated with Ollama info")
-            
-            # Optional: Cleanup old models
-            cleanup_old_ollama_models(USER_ID, keep_versions=3)
+            print("  ✅ Registered with cloud Ollama")
         else:
-            print(f"  ⚠️  Ollama registration failed (training still successful)")
+            print("  ⚠️  Cloud Ollama registration failed")
     else:
-        print(f"  ⚠️  Ollama not available (skipping registration)")
-
+        print("\n📋 STEP 12: Ollama not available (skipped)")
+    
     # Update DB
-    print("\n📋 STEP 12: Updating database...")
+    print("\n📋 Updating database...")
     update_training_status(TRAINING_ID, 'completed')
 
     training_success = True
 
     print("\n" + "="*60)
-    print("✅✅✅ TRAINING COMPLETED SUCCESSFULLY")
+    print("✅✅✅ TRAINING COMPLETED")
     print("="*60)
     print(f"📊 Summary:")
     print(f"   Training ID: {TRAINING_ID}")
-    print(f"   Mode: {'INCREMENTAL' if IS_INCREMENTAL else 'FULL'}")
-    print(f"   Version: {ADAPTER_VERSION}")
-    print(f"   Samples: {len(sampled)}/{total_samples}")
+    print(f"   Version: {NEW_VERSION}")
+    print(f"   Samples: {total_samples}")
     print(f"   Loss: {result.training_loss:.4f}")
-    print(f"   Output: {OUTPUT_DIR}")
-    print(f"   Ollama: {'✅ Registered' if ollama_success else '⚠️  Not registered'}")
-    if ollama_success:
-        print(f"   Model Name: ethical-{USER_ID[:8]}-{ADAPTER_VERSION}")
+    print(f"   Postgres: {'✅ Saved' if save_success else '❌ Failed'}")
+    print(f"   Cloud Ollama: {'✅ Registered' if ollama_success else '⚠️  Skipped'}")
     print("="*60)
 
 except Exception as e:
-    print(f"\n" + "="*60)
-    print(f"❌ TRAINING FAILED")
-    print("="*60)
-    print(f"Error: {e}")
+    print(f"\n❌ TRAINING FAILED: {e}")
     import traceback
     traceback.print_exc()
-    print("="*60)
     
     if TRAINING_ID:
         update_training_status(TRAINING_ID, 'failed', str(e))
@@ -855,23 +622,9 @@ except Exception as e:
     training_success = False
 
 finally:
-    # Always try to scale down
-    print("\n" + "="*60)
-    print("🔄 CLEANUP: Attempting to scale down service...")
-    print("="*60)
-    
+    print("\n🔄 Cleanup...")
     time.sleep(3)
+    scale_service_to_zero()
     
-    scale_success = scale_service_to_zero()
-    
-    if scale_success:
-        print("\n✅ Service scaled down successfully")
-    else:
-        print("\n⚠️  Service scale down failed")
-    
-    print("\n" + "="*60)
-    print(f"{'✅ PROCESS COMPLETED' if training_success else '❌ PROCESS FAILED'}")
-    print("="*60)
-    
+    print(f"\n{'✅ COMPLETED' if training_success else '❌ FAILED'}")
     sys.exit(0 if training_success else 1)
-    
