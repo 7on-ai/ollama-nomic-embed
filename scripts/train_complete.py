@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-LoRA Training Pipeline - FIXED POSTGRES PERMISSIONS + OLLAMA REGISTRATION
+LoRA Training Pipeline - FIXED OLLAMA BLOB UPLOAD
 ✅ Use ADMIN connection for schema setup
 ✅ Fallback to regular connection for normal operations
-✅ Proper Ollama registration with streaming API
+✅ Proper Ollama registration with blob upload (not file path)
 """
 
 import os
@@ -14,6 +14,7 @@ import gc
 import requests
 import time
 import re
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -236,7 +237,7 @@ def save_adapter_to_postgres(postgres_uri: str, user_id: str, version: str, adap
         return False
 
 def check_ollama_health(ollama_url: str, max_retries: int = 5) -> bool:
-    """ตรวจสอบว่า Ollama service พร้อมใช้งาน"""
+    """Check if Ollama service is ready"""
     for attempt in range(max_retries):
         try:
             response = requests.get(f"{ollama_url}/api/tags", timeout=10)
@@ -257,10 +258,10 @@ def register_adapter_with_ollama(
     user_id: str, 
     version: str,
     postgres_uri: str,
-    base_model: str = "tinyllama:latest"
+    base_model: str = "tinyllama"
 ) -> tuple:
     """
-    Register adapter with Ollama using streaming API
+    Register adapter with Ollama by uploading blob first (FIXED)
     
     Returns:
         (success: bool, message: str)
@@ -272,8 +273,8 @@ def register_adapter_with_ollama(
         if not check_ollama_health(ollama_url):
             return False, "Ollama service not available"
         
+        # Step 1: Fetch adapter from Postgres
         print(f"  📥 Fetching adapter from Postgres...")
-        
         conn = psycopg2.connect(postgres_uri)
         cursor = conn.cursor()
         
@@ -294,25 +295,45 @@ def register_adapter_with_ollama(
         adapter_data = bytes(row[0])
         print(f"  ✅ Fetched adapter ({len(adapter_data):,} bytes)")
         
-        temp_path = f"/tmp/adapter_{version}.safetensors"
-        with open(temp_path, 'wb') as f:
-            f.write(adapter_data)
-        print(f"  💾 Saved to {temp_path}")
+        # Step 2: Calculate SHA256 digest
+        blob_digest = hashlib.sha256(adapter_data).hexdigest()
+        print(f"  🔑 Blob digest: sha256:{blob_digest}")
         
+        # Step 3: Upload adapter as blob to Ollama
+        print(f"  📤 Uploading adapter blob to Ollama...")
+        
+        blob_response = requests.post(
+            f"{ollama_url}/api/blobs/sha256:{blob_digest}",
+            data=adapter_data,
+            headers={'Content-Type': 'application/octet-stream'},
+            timeout=120
+        )
+        
+        if not blob_response.ok:
+            # Check if blob already exists (this is OK)
+            if blob_response.status_code == 400:
+                print(f"  ℹ️  Blob may already exist (continuing...)")
+            else:
+                return False, f"Blob upload failed: {blob_response.status_code} - {blob_response.text[:200]}"
+        else:
+            print(f"  ✅ Blob uploaded successfully")
+        
+        # Step 4: Create model with blob reference
         model_name = f"ethical-{user_id[:8]}-{version}"
-        print(f"  🤖 Model name: {model_name}")
+        print(f"  🤖 Creating model: {model_name}")
         
+        # Use @sha256: prefix to reference uploaded blob
         modelfile = f"""FROM {base_model}
-ADAPTER {temp_path}
+ADAPTER @sha256:{blob_digest}
 PARAMETER temperature 0.7
 PARAMETER top_p 0.9
 PARAMETER top_k 40
 PARAMETER num_ctx 2048
+PARAMETER stop "<|im_end|>"
 SYSTEM You are a supportive AI assistant focused on ethical growth and compassionate guidance.
 """
         
-        print(f"  📝 Modelfile prepared")
-        print(f"  🔄 Registering model (this may take 30-60 seconds)...")
+        print(f"  🔄 Registering model with Ollama (this may take 30-60 seconds)...")
         
         response = requests.post(
             f"{ollama_url}/api/create",
@@ -326,8 +347,9 @@ SYSTEM You are a supportive AI assistant focused on ethical growth and compassio
         )
         
         if not response.ok:
-            return False, f"Registration failed: {response.status_code} - {response.text[:200]}"
+            return False, f"Model creation failed: {response.status_code} - {response.text[:200]}"
         
+        # Step 5: Process streaming response
         print(f"  📊 Processing response...")
         last_status = None
         
@@ -349,6 +371,7 @@ SYSTEM You are a supportive AI assistant focused on ethical growth and compassio
         
         print(f"  ✅ Model registered successfully!")
         
+        # Step 6: Verify registration
         print(f"  🔍 Verifying registration...")
         verify_response = requests.post(
             f"{ollama_url}/api/show",
@@ -359,15 +382,11 @@ SYSTEM You are a supportive AI assistant focused on ethical growth and compassio
         if verify_response.ok:
             model_info = verify_response.json()
             print(f"  ✅ Verified: Model exists in Ollama")
-            print(f"     Size: {model_info.get('size', 'unknown')}")
+            size = model_info.get('size', 0)
+            if size:
+                print(f"     Size: {size / 1024 / 1024:.1f} MB")
         else:
-            print(f"  ⚠️  Could not verify (but registration completed)")
-        
-        try:
-            os.remove(temp_path)
-            print(f"  🗑️  Cleaned up temp file")
-        except:
-            pass
+            print(f"  ⚠️  Could not verify (but creation completed)")
         
         return True, model_name
         
@@ -382,7 +401,7 @@ SYSTEM You are a supportive AI assistant focused on ethical growth and compassio
         return False, f"Registration error: {str(e)}"
 
 def test_registered_model(ollama_url: str, model_name: str) -> bool:
-    """ทดสอบ model ที่ register แล้ว"""
+    """Test registered model"""
     try:
         print(f"\n  🧪 Testing model: {model_name}")
         
@@ -756,7 +775,7 @@ try:
     if not save_success:
         print("⚠️  Warning: Failed to save to Postgres")
     
-    # Ollama registration
+    # Ollama registration with blob upload
     if OLLAMA_ENABLED and save_success:
         try:
             ollama_success, result_message = register_adapter_with_ollama(
@@ -764,7 +783,7 @@ try:
                 user_id=USER_ID,
                 version=NEW_VERSION,
                 postgres_uri=POSTGRES_URI,
-                base_model="tinyllama:latest"
+                base_model="tinyllama"
             )
             
             if ollama_success:
