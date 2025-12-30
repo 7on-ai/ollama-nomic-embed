@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-LoRA Training Pipeline - FIXED OLLAMA REGISTRATION
-✅ Remove duplicate variable declarations
-✅ Move Ollama registration inside try block
+LoRA Training Pipeline - FIXED POSTGRES PERMISSIONS
+✅ Use ADMIN connection for schema setup
+✅ Fallback to regular connection for normal operations
 """
 
 import os
@@ -59,17 +59,19 @@ CONFIG = {
 # ===== Environment =====
 print("\n📋 STEP 2: Validating environment...")
 POSTGRES_URI = os.environ.get("POSTGRES_URI")
+POSTGRES_URI_ADMIN = os.environ.get("POSTGRES_URI_ADMIN") or os.environ.get("NF_DATABASE_EXTERNAL_POSTGRES_URI_ADMIN")
 USER_ID = os.environ.get("USER_ID")
 MODEL_NAME = os.environ.get("MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 OUTPUT_BASE = "/tmp/adapters"
 NORTHFLANK_API_TOKEN = os.environ.get("NORTHFLANK_API_TOKEN")
 NORTHFLANK_PROJECT_ID = os.environ.get("NORTHFLANK_PROJECT_ID")
 
-# ✅ Ollama config (declared once here)
+# Ollama config
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_ENABLED = os.environ.get("OLLAMA_ENABLED", "false").lower() == "true"
 
 print(f"  POSTGRES_URI: {'✅ SET' if POSTGRES_URI else '❌ MISSING'}")
+print(f"  POSTGRES_URI_ADMIN: {'✅ SET' if POSTGRES_URI_ADMIN else '⚠️  MISSING (will use regular URI)'}")
 print(f"  USER_ID: {USER_ID or '❌ MISSING'}")
 print(f"  MODEL_NAME: {MODEL_NAME}")
 print(f"  OUTPUT_BASE: {OUTPUT_BASE}")
@@ -80,17 +82,25 @@ if not POSTGRES_URI or not USER_ID:
     print("\n❌ FATAL: Missing required environment variables")
     sys.exit(1)
 
+# Use admin connection for setup if available
+SETUP_URI = POSTGRES_URI_ADMIN if POSTGRES_URI_ADMIN else POSTGRES_URI
+
 # ===== Helper Functions =====
 
-def save_adapter_to_postgres(postgres_uri: str, user_id: str, version: str, adapter_dir: str):
-    """Save adapter files to Postgres as BYTEA"""
+def ensure_adapter_files_table():
+    """Ensure adapter_files table exists with proper permissions"""
     try:
-        print("\n📦 STEP 11: Saving adapter to Postgres...")
+        print("\n🔧 Setting up adapter_files table...")
         
-        conn = psycopg2.connect(postgres_uri)
+        conn = psycopg2.connect(SETUP_URI)
+        conn.autocommit = True
         cursor = conn.cursor()
         
-        # Create table if not exists
+        # Create schema if not exists
+        cursor.execute("CREATE SCHEMA IF NOT EXISTS user_data_schema")
+        print("  ✅ Schema exists")
+        
+        # Create table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_data_schema.adapter_files (
                 id SERIAL PRIMARY KEY,
@@ -104,13 +114,52 @@ def save_adapter_to_postgres(postgres_uri: str, user_id: str, version: str, adap
                 UNIQUE(user_id, version, filename)
             )
         """)
+        print("  ✅ Table created")
         
+        # Create index
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_adapter_files_user_version 
             ON user_data_schema.adapter_files(user_id, version)
         """)
+        print("  ✅ Index created")
         
-        conn.commit()
+        # Grant permissions to regular user if using admin connection
+        if POSTGRES_URI_ADMIN and POSTGRES_URI != POSTGRES_URI_ADMIN:
+            try:
+                # Extract regular username from connection string
+                import re
+                match = re.search(r'postgresql://([^:]+):', POSTGRES_URI)
+                if match:
+                    regular_user = match.group(1)
+                    print(f"  📝 Granting permissions to: {regular_user}")
+                    
+                    cursor.execute(f"GRANT USAGE ON SCHEMA user_data_schema TO {regular_user}")
+                    cursor.execute(f"GRANT ALL PRIVILEGES ON TABLE user_data_schema.adapter_files TO {regular_user}")
+                    cursor.execute(f"GRANT USAGE, SELECT ON SEQUENCE user_data_schema.adapter_files_id_seq TO {regular_user}")
+                    
+                    print("  ✅ Permissions granted")
+            except Exception as perm_error:
+                print(f"  ⚠️  Permission grant warning: {perm_error}")
+        
+        cursor.close()
+        conn.close()
+        
+        return True
+        
+    except Exception as e:
+        print(f"  ❌ Table setup failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def save_adapter_to_postgres(postgres_uri: str, user_id: str, version: str, adapter_dir: str):
+    """Save adapter files to Postgres as BYTEA"""
+    try:
+        print("\n📦 STEP 11: Saving adapter to Postgres...")
+        
+        # Use regular connection for data operations
+        conn = psycopg2.connect(postgres_uri)
+        cursor = conn.cursor()
         
         # Files to save
         files_to_save = [
@@ -137,6 +186,7 @@ def save_adapter_to_postgres(postgres_uri: str, user_id: str, version: str, adap
             
             print(f"  📤 Saving {filename} ({file_size:,} bytes)...")
             
+            # Size limit: 10MB per file
             if file_size > 10 * 1024 * 1024:
                 print(f"     ⚠️  File too large ({file_size / 1024 / 1024:.1f} MB), skipping")
                 continue
@@ -147,29 +197,34 @@ def save_adapter_to_postgres(postgres_uri: str, user_id: str, version: str, adap
                 'base_model': MODEL_NAME,
             }
             
-            cursor.execute("""
-                INSERT INTO user_data_schema.adapter_files
-                (user_id, version, filename, data, size, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (user_id, version, filename)
-                DO UPDATE SET 
-                    data = EXCLUDED.data,
-                    size = EXCLUDED.size,
-                    metadata = EXCLUDED.metadata,
-                    created_at = NOW()
-            """, (
-                user_id,
-                version,
-                filename,
-                psycopg2.Binary(file_data),
-                file_size,
-                json.dumps(metadata)
-            ))
-            
-            saved_count += 1
-            print(f"     ✅ Saved to Postgres")
+            try:
+                cursor.execute("""
+                    INSERT INTO user_data_schema.adapter_files
+                    (user_id, version, filename, data, size, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id, version, filename)
+                    DO UPDATE SET 
+                        data = EXCLUDED.data,
+                        size = EXCLUDED.size,
+                        metadata = EXCLUDED.metadata,
+                        created_at = NOW()
+                """, (
+                    user_id,
+                    version,
+                    filename,
+                    psycopg2.Binary(file_data),
+                    file_size,
+                    json.dumps(metadata)
+                ))
+                
+                conn.commit()
+                saved_count += 1
+                print(f"     ✅ Saved to Postgres")
+                
+            except Exception as insert_error:
+                print(f"     ❌ Insert failed: {insert_error}")
+                conn.rollback()
         
-        conn.commit()
         cursor.close()
         conn.close()
         
@@ -325,6 +380,10 @@ try:
     print(f"  ✅ Connected: {version[:60]}...")
     cursor.close()
     conn.close()
+
+    # ===== SETUP ADAPTER_FILES TABLE =====
+    if not ensure_adapter_files_table():
+        print("\n⚠️  Warning: Table setup failed, but continuing...")
 
     # Auto-approve memories
     conn = psycopg2.connect(POSTGRES_URI)
@@ -524,7 +583,7 @@ try:
         print("⚠️  Warning: Failed to save to Postgres")
     
     # ===== STEP 12: OLLAMA REGISTRATION (OPTIONAL) =====
-    if OLLAMA_ENABLED:
+    if OLLAMA_ENABLED and save_success:
         print("\n📋 STEP 12: Registering with Ollama...")
         
         try:
@@ -558,7 +617,7 @@ try:
                 
                 print(f"  📁 Temp file: {temp_path} ({len(adapter_data):,} bytes)")
                 
-                # Create Modelfile with absolute path
+                # Create Modelfile
                 modelfile_content = f"""FROM tinyllama
 ADAPTER {temp_path}
 PARAMETER temperature 0.7
@@ -566,7 +625,7 @@ PARAMETER top_p 0.9
 PARAMETER num_ctx 2048
 """
                 
-                print(f"  📝 Modelfile:\n{modelfile_content}")
+                print(f"  📝 Modelfile created")
                 
                 # Call Ollama API
                 print(f"  🔄 Calling {OLLAMA_URL}/api/create...")
@@ -602,7 +661,11 @@ PARAMETER num_ctx 2048
             import traceback
             traceback.print_exc()
     else:
-        print("\n📋 STEP 12: Ollama registration disabled")
+        print("\n📋 STEP 12: Ollama registration skipped")
+        if not OLLAMA_ENABLED:
+            print("  (OLLAMA_ENABLED=false)")
+        if not save_success:
+            print("  (Postgres save failed)")
     
     # Update DB
     print("\n📋 Updating database...")
