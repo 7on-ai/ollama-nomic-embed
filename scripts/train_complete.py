@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-LoRA Training Pipeline - FIXED OLLAMA BEFORE SCALE DOWN
-✅ Move Ollama registration BEFORE cleanup
-✅ Add retry logic for Ollama
-✅ Better error handling
+LoRA Training Pipeline - FIXED POSTGRES PERMISSIONS + OLLAMA REGISTRATION
+✅ Use ADMIN connection for schema setup
+✅ Fallback to regular connection for normal operations
+✅ Proper Ollama registration with streaming API
 """
 
 import os
@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 print("="*60)
-print("🚀 LoRA Training + Ollama Registration")
+print("🚀 LoRA Training + Postgres Storage + Ollama Registration")
 print("="*60)
 print(f"Time: {datetime.utcnow().isoformat()}Z")
 print(f"Python: {sys.version}")
@@ -60,6 +60,7 @@ CONFIG = {
 # ===== Environment =====
 print("\n📋 STEP 2: Validating environment...")
 POSTGRES_URI = os.environ.get("POSTGRES_URI")
+POSTGRES_URI_ADMIN = os.environ.get("POSTGRES_URI_ADMIN") or os.environ.get("NF_DATABASE_EXTERNAL_POSTGRES_URI_ADMIN")
 USER_ID = os.environ.get("USER_ID")
 MODEL_NAME = os.environ.get("MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 OUTPUT_BASE = "/tmp/adapters"
@@ -68,9 +69,10 @@ NORTHFLANK_PROJECT_ID = os.environ.get("NORTHFLANK_PROJECT_ID")
 
 # Ollama config
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
-OLLAMA_ENABLED = os.environ.get("OLLAMA_ENABLED", "true").lower() == "true"
+OLLAMA_ENABLED = os.environ.get("OLLAMA_ENABLED", "false").lower() == "true"
 
 print(f"  POSTGRES_URI: {'✅ SET' if POSTGRES_URI else '❌ MISSING'}")
+print(f"  POSTGRES_URI_ADMIN: {'✅ SET' if POSTGRES_URI_ADMIN else '⚠️  MISSING (will use regular URI)'}")
 print(f"  USER_ID: {USER_ID or '❌ MISSING'}")
 print(f"  MODEL_NAME: {MODEL_NAME}")
 print(f"  OUTPUT_BASE: {OUTPUT_BASE}")
@@ -81,16 +83,25 @@ if not POSTGRES_URI or not USER_ID:
     print("\n❌ FATAL: Missing required environment variables")
     sys.exit(1)
 
+# Use admin connection for setup if available
+SETUP_URI = POSTGRES_URI_ADMIN if POSTGRES_URI_ADMIN else POSTGRES_URI
+
 # ===== Helper Functions =====
 
-def save_adapter_to_postgres(postgres_uri: str, user_id: str, version: str, adapter_dir: str):
-    """Save adapter files to Postgres as BYTEA"""
+def ensure_adapter_files_table():
+    """Ensure adapter_files table exists with proper permissions"""
     try:
-        print("\n📦 STEP 11: Saving adapter to Postgres...")
+        print("\n🔧 Setting up adapter_files table...")
         
-        conn = psycopg2.connect(postgres_uri)
+        conn = psycopg2.connect(SETUP_URI)
+        conn.autocommit = True
         cursor = conn.cursor()
         
+        # Create schema if not exists
+        cursor.execute("CREATE SCHEMA IF NOT EXISTS user_data_schema")
+        print("  ✅ Schema exists")
+        
+        # Create table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_data_schema.adapter_files (
                 id SERIAL PRIMARY KEY,
@@ -104,13 +115,49 @@ def save_adapter_to_postgres(postgres_uri: str, user_id: str, version: str, adap
                 UNIQUE(user_id, version, filename)
             )
         """)
+        print("  ✅ Table created")
         
+        # Create index
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_adapter_files_user_version 
             ON user_data_schema.adapter_files(user_id, version)
         """)
+        print("  ✅ Index created")
         
-        conn.commit()
+        # Grant permissions to regular user if using admin connection
+        if POSTGRES_URI_ADMIN and POSTGRES_URI != POSTGRES_URI_ADMIN:
+            try:
+                match = re.search(r'postgresql://([^:]+):', POSTGRES_URI)
+                if match:
+                    regular_user = match.group(1)
+                    print(f"  📝 Granting permissions to: {regular_user}")
+                    
+                    cursor.execute(f"GRANT USAGE ON SCHEMA user_data_schema TO {regular_user}")
+                    cursor.execute(f"GRANT ALL PRIVILEGES ON TABLE user_data_schema.adapter_files TO {regular_user}")
+                    cursor.execute(f"GRANT USAGE, SELECT ON SEQUENCE user_data_schema.adapter_files_id_seq TO {regular_user}")
+                    
+                    print("  ✅ Permissions granted")
+            except Exception as perm_error:
+                print(f"  ⚠️  Permission grant warning: {perm_error}")
+        
+        cursor.close()
+        conn.close()
+        
+        return True
+        
+    except Exception as e:
+        print(f"  ❌ Table setup failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def save_adapter_to_postgres(postgres_uri: str, user_id: str, version: str, adapter_dir: str):
+    """Save adapter files to Postgres as BYTEA"""
+    try:
+        print("\n📦 STEP 11: Saving adapter to Postgres...")
+        
+        conn = psycopg2.connect(postgres_uri)
+        cursor = conn.cursor()
         
         files_to_save = [
             'adapter_model.safetensors',
@@ -146,29 +193,34 @@ def save_adapter_to_postgres(postgres_uri: str, user_id: str, version: str, adap
                 'base_model': MODEL_NAME,
             }
             
-            cursor.execute("""
-                INSERT INTO user_data_schema.adapter_files
-                (user_id, version, filename, data, size, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (user_id, version, filename)
-                DO UPDATE SET 
-                    data = EXCLUDED.data,
-                    size = EXCLUDED.size,
-                    metadata = EXCLUDED.metadata,
-                    created_at = NOW()
-            """, (
-                user_id,
-                version,
-                filename,
-                psycopg2.Binary(file_data),
-                file_size,
-                json.dumps(metadata)
-            ))
-            
-            saved_count += 1
-            print(f"     ✅ Saved to Postgres")
+            try:
+                cursor.execute("""
+                    INSERT INTO user_data_schema.adapter_files
+                    (user_id, version, filename, data, size, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id, version, filename)
+                    DO UPDATE SET 
+                        data = EXCLUDED.data,
+                        size = EXCLUDED.size,
+                        metadata = EXCLUDED.metadata,
+                        created_at = NOW()
+                """, (
+                    user_id,
+                    version,
+                    filename,
+                    psycopg2.Binary(file_data),
+                    file_size,
+                    json.dumps(metadata)
+                ))
+                
+                conn.commit()
+                saved_count += 1
+                print(f"     ✅ Saved to Postgres")
+                
+            except Exception as insert_error:
+                print(f"     ❌ Insert failed: {insert_error}")
+                conn.rollback()
         
-        conn.commit()
         cursor.close()
         conn.close()
         
@@ -183,157 +235,183 @@ def save_adapter_to_postgres(postgres_uri: str, user_id: str, version: str, adap
         traceback.print_exc()
         return False
 
-def register_with_ollama(postgres_uri: str, user_id: str, version: str, max_retries: int = 3):
-    """Register adapter with Ollama - with retry logic"""
-    
-    if not OLLAMA_ENABLED:
-        print("\n📋 STEP 12: Ollama registration disabled")
-        return False
-    
-    print("\n📋 STEP 12: Registering with Ollama...")
-    print("="*60)
-    
-    model_name = f"ethical-{user_id[:8]}-{version}"
-    print(f"  🤖 Model name: {model_name}")
-    print(f"  🔗 Ollama URL: {OLLAMA_URL}")
-    
-    for attempt in range(1, max_retries + 1):
+def check_ollama_health(ollama_url: str, max_retries: int = 5) -> bool:
+    """ตรวจสอบว่า Ollama service พร้อมใช้งาน"""
+    for attempt in range(max_retries):
         try:
-            print(f"\n  🔄 Attempt {attempt}/{max_retries}...")
-            
-            # Get adapter from Postgres
-            conn = psycopg2.connect(postgres_uri)
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT data FROM user_data_schema.adapter_files
-                WHERE user_id = %s AND version = %s AND filename = 'adapter_model.safetensors'
-            """, (user_id, version))
-            
-            row = cursor.fetchone()
-            cursor.close()
-            conn.close()
-            
-            if not row:
-                print("  ❌ Adapter not found in Postgres")
-                return False
-            
-            adapter_data = bytes(row[0])
-            print(f"  📦 Retrieved adapter: {len(adapter_data):,} bytes")
-            
-            # Save temporarily
-            temp_path = f"/tmp/adapter_{version}.safetensors"
-            with open(temp_path, 'wb') as f:
-                f.write(adapter_data)
-            
-            print(f"  📁 Temp file: {temp_path}")
-            
-            # Verify file exists
-            if not os.path.exists(temp_path):
-                print(f"  ❌ Temp file not created!")
-                continue
-            
-            # Create Modelfile
-            modelfile_content = f"""FROM tinyllama
+            response = requests.get(f"{ollama_url}/api/tags", timeout=10)
+            if response.ok:
+                print(f"  ✅ Ollama is ready")
+                return True
+            print(f"  ⏳ Attempt {attempt + 1}/{max_retries}: Status {response.status_code}")
+        except Exception as e:
+            print(f"  ⏳ Attempt {attempt + 1}/{max_retries}: {str(e)[:50]}")
+        
+        if attempt < max_retries - 1:
+            time.sleep(5)
+    
+    return False
+
+def register_adapter_with_ollama(
+    ollama_url: str,
+    user_id: str, 
+    version: str,
+    postgres_uri: str,
+    base_model: str = "tinyllama:latest"
+) -> tuple:
+    """
+    Register adapter with Ollama using streaming API
+    
+    Returns:
+        (success: bool, message: str)
+    """
+    try:
+        print(f"\n📋 STEP 12: Registering with Ollama...")
+        print(f"  🔗 Ollama URL: {ollama_url}")
+        
+        if not check_ollama_health(ollama_url):
+            return False, "Ollama service not available"
+        
+        print(f"  📥 Fetching adapter from Postgres...")
+        
+        conn = psycopg2.connect(postgres_uri)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT data FROM user_data_schema.adapter_files
+            WHERE user_id = %s 
+              AND version = %s 
+              AND filename = 'adapter_model.safetensors'
+        """, (user_id, version))
+        
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if not row:
+            return False, "Adapter not found in Postgres"
+        
+        adapter_data = bytes(row[0])
+        print(f"  ✅ Fetched adapter ({len(adapter_data):,} bytes)")
+        
+        temp_path = f"/tmp/adapter_{version}.safetensors"
+        with open(temp_path, 'wb') as f:
+            f.write(adapter_data)
+        print(f"  💾 Saved to {temp_path}")
+        
+        model_name = f"ethical-{user_id[:8]}-{version}"
+        print(f"  🤖 Model name: {model_name}")
+        
+        modelfile = f"""FROM {base_model}
 ADAPTER {temp_path}
 PARAMETER temperature 0.7
 PARAMETER top_p 0.9
+PARAMETER top_k 40
 PARAMETER num_ctx 2048
+SYSTEM You are a supportive AI assistant focused on ethical growth and compassionate guidance.
 """
-            
-            print(f"  📝 Modelfile:\n{modelfile_content}")
-            
-            # Test Ollama connection first
-            print(f"  🔍 Testing Ollama connection...")
-            test_response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
-            
-            if not test_response.ok:
-                print(f"  ⚠️  Ollama not ready: {test_response.status_code}")
-                if attempt < max_retries:
-                    print(f"  ⏳ Waiting 10s before retry...")
-                    time.sleep(10)
-                    continue
-                else:
-                    return False
-            
-            print(f"  ✅ Ollama is ready")
-            
-            # Call Ollama API
-            print(f"  🚀 Calling {OLLAMA_URL}/api/create...")
-            
-            response = requests.post(
-                f"{OLLAMA_URL}/api/create",
-                json={
-                    "name": model_name,
-                    "modelfile": modelfile_content,
-                },
-                timeout=120
-            )
-            
-            print(f"  📊 Response status: {response.status_code}")
-            
-            if response.ok:
-                print(f"  ✅✅✅ Registered: {model_name}")
-                
-                # Verify registration
-                print(f"  🔍 Verifying registration...")
-                verify_response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
-                
-                if verify_response.ok:
-                    models = verify_response.json().get('models', [])
-                    model_names = [m['name'] for m in models]
-                    
-                    if model_name in model_names or f"{model_name}:latest" in model_names:
-                        print(f"  ✅ Verification successful!")
-                        print(f"  📋 Available models: {model_names}")
-                    else:
-                        print(f"  ⚠️  Model not in list: {model_names}")
-                
-                # Cleanup temp file
-                try:
-                    os.remove(temp_path)
-                    print(f"  🗑️  Cleaned up temp file")
-                except:
-                    pass
-                
-                return True
-            else:
-                response_text = response.text[:500]
-                print(f"  ❌ Registration failed: {response.status_code}")
-                print(f"  📄 Response: {response_text}")
-                
-                if attempt < max_retries:
-                    print(f"  ⏳ Waiting 10s before retry...")
-                    time.sleep(10)
-                else:
-                    # Cleanup temp file
-                    try:
-                        os.remove(temp_path)
-                    except:
-                        pass
-                    
-                    return False
-            
-        except requests.exceptions.Timeout:
-            print(f"  ⏱️  Timeout on attempt {attempt}")
-            if attempt < max_retries:
-                print(f"  ⏳ Waiting 10s before retry...")
-                time.sleep(10)
-            else:
-                return False
         
-        except Exception as e:
-            print(f"  ❌ Error on attempt {attempt}: {e}")
-            import traceback
-            traceback.print_exc()
+        print(f"  📝 Modelfile prepared")
+        print(f"  🔄 Registering model (this may take 30-60 seconds)...")
+        
+        response = requests.post(
+            f"{ollama_url}/api/create",
+            json={
+                "name": model_name,
+                "modelfile": modelfile,
+                "stream": True
+            },
+            stream=True,
+            timeout=300
+        )
+        
+        if not response.ok:
+            return False, f"Registration failed: {response.status_code} - {response.text[:200]}"
+        
+        print(f"  📊 Processing response...")
+        last_status = None
+        
+        for line in response.iter_lines():
+            if line:
+                try:
+                    data = json.loads(line)
+                    status = data.get('status')
+                    
+                    if status and status != last_status:
+                        print(f"     {status}")
+                        last_status = status
+                    
+                    if 'error' in data:
+                        return False, f"Ollama error: {data['error']}"
+                    
+                except json.JSONDecodeError:
+                    continue
+        
+        print(f"  ✅ Model registered successfully!")
+        
+        print(f"  🔍 Verifying registration...")
+        verify_response = requests.post(
+            f"{ollama_url}/api/show",
+            json={"name": model_name},
+            timeout=10
+        )
+        
+        if verify_response.ok:
+            model_info = verify_response.json()
+            print(f"  ✅ Verified: Model exists in Ollama")
+            print(f"     Size: {model_info.get('size', 'unknown')}")
+        else:
+            print(f"  ⚠️  Could not verify (but registration completed)")
+        
+        try:
+            os.remove(temp_path)
+            print(f"  🗑️  Cleaned up temp file")
+        except:
+            pass
+        
+        return True, model_name
+        
+    except requests.exceptions.Timeout:
+        return False, "Ollama request timeout (service may be overloaded)"
+    except requests.exceptions.ConnectionError:
+        return False, "Cannot connect to Ollama service"
+    except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"  ❌ Error details:\n{error_detail}")
+        return False, f"Registration error: {str(e)}"
+
+def test_registered_model(ollama_url: str, model_name: str) -> bool:
+    """ทดสอบ model ที่ register แล้ว"""
+    try:
+        print(f"\n  🧪 Testing model: {model_name}")
+        
+        response = requests.post(
+            f"{ollama_url}/api/generate",
+            json={
+                "model": model_name,
+                "prompt": "Hello! How can I support your growth today?",
+                "stream": False,
+                "options": {
+                    "temperature": 0.7,
+                    "num_predict": 50
+                }
+            },
+            timeout=60
+        )
+        
+        if response.ok:
+            result = response.json()
+            generated_text = result.get('response', '')
+            print(f"  ✅ Model works! Response: {generated_text[:100]}...")
+            return True
+        else:
+            print(f"  ⚠️  Test failed: {response.status_code}")
+            return False
             
-            if attempt < max_retries:
-                print(f"  ⏳ Waiting 10s before retry...")
-                time.sleep(10)
-            else:
-                return False
-    
-    return False
+    except Exception as e:
+        print(f"  ⚠️  Test error: {e}")
+        return False
 
 def scale_service_to_zero():
     """Scale service to 0"""
@@ -342,8 +420,7 @@ def scale_service_to_zero():
         return False
     
     try:
-        print("\n📊 STEP 13: Scaling service to 0...")
-        print("="*60)
+        print("\n📊 Scaling service to 0...")
         
         response = requests.post(
             f"https://api.northflank.com/v1/projects/{NORTHFLANK_PROJECT_ID}/services/lora-training/scale",
@@ -477,6 +554,10 @@ try:
     print(f"  ✅ Connected: {version[:60]}...")
     cursor.close()
     conn.close()
+
+    # Setup adapter_files table
+    if not ensure_adapter_files_table():
+        print("\n⚠️  Warning: Table setup failed, but continuing...")
 
     # Auto-approve memories
     conn = psycopg2.connect(POSTGRES_URI)
@@ -664,7 +745,7 @@ try:
     with open(os.path.join(OUTPUT_DIR, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
 
-    # STEP 11: Save to Postgres
+    # Save to Postgres
     save_success = save_adapter_to_postgres(
         POSTGRES_URI, 
         USER_ID, 
@@ -675,13 +756,37 @@ try:
     if not save_success:
         print("⚠️  Warning: Failed to save to Postgres")
     
-    # ===== STEP 12: OLLAMA REGISTRATION (BEFORE SCALE DOWN!) =====
-    ollama_success = register_with_ollama(
-        POSTGRES_URI,
-        USER_ID,
-        NEW_VERSION,
-        max_retries=3
-    )
+    # Ollama registration
+    if OLLAMA_ENABLED and save_success:
+        try:
+            ollama_success, result_message = register_adapter_with_ollama(
+                ollama_url=OLLAMA_URL,
+                user_id=USER_ID,
+                version=NEW_VERSION,
+                postgres_uri=POSTGRES_URI,
+                base_model="tinyllama:latest"
+            )
+            
+            if ollama_success:
+                print(f"  ✅ Ollama registration: SUCCESS")
+                print(f"  🎉 Model available as: {result_message}")
+                
+                test_registered_model(OLLAMA_URL, result_message)
+            else:
+                print(f"  ⚠️  Ollama registration: FAILED")
+                print(f"  📄 Reason: {result_message}")
+                
+        except Exception as e:
+            print(f"  ❌ Ollama error: {e}")
+            import traceback
+            traceback.print_exc()
+            ollama_success = False
+    else:
+        print("\n📋 STEP 12: Ollama registration skipped")
+        if not OLLAMA_ENABLED:
+            print("  (OLLAMA_ENABLED=false)")
+        if not save_success:
+            print("  (Postgres save failed)")
     
     # Update DB
     print("\n📋 Updating database...")
@@ -698,7 +803,7 @@ try:
     print(f"   Samples: {total_samples}")
     print(f"   Loss: {result.training_loss:.4f}")
     print(f"   Postgres: {'✅ Saved' if save_success else '❌ Failed'}")
-    print(f"   Ollama: {'✅ Registered' if ollama_success else '⚠️  Failed'}")
+    print(f"   Ollama: {'✅ Registered' if ollama_success else '⚠️  Skipped/Failed'}")
     print("="*60)
 
 except Exception as e:
@@ -712,9 +817,8 @@ except Exception as e:
     training_success = False
 
 finally:
-    # ✅ CRITICAL: Scale down happens LAST
-    print("\n🔄 Final cleanup...")
-    time.sleep(5)  # Give Ollama time to finish
+    print("\n🔄 Cleanup...")
+    time.sleep(3)
     scale_service_to_zero()
     
     print(f"\n{'✅ COMPLETED' if training_success else '❌ FAILED'}")
