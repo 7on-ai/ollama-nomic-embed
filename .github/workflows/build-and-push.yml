@@ -8,7 +8,7 @@ on:
       - 'Dockerfile'
       - 'scripts/**'
       - 'docker-compose.yml'
-  workflow_dispatch:  # เพิ่มบรรทัดนี้เพื่อให้ trigger manual ได้
+  workflow_dispatch:
 
 jobs:
   build-and-push:
@@ -16,19 +16,20 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write  # ← เพิ่มบรรทัดนี้
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Log in to GitHub Container Registry
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
+      - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
